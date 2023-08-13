@@ -1,0 +1,5428 @@
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/times.h>
+#include <sys/time.h>
+#include <math.h>
+#include <gd.h>
+#include <zlib.h>
+
+#include <mysql.h>
+
+#include "Empire.hpp"
+#include "EmpireBD.hpp"
+#include "Score.hpp"
+#include "ClientConn.hpp"
+
+using namespace Empire;
+
+ThreadLogFile('E','m','p','i','r','e',0);
+#define LM TLR(__tls__.m_Cap,__func__)
+
+//#define LM TLR(TLC,NULL)
+//#define LM if(g_LogMem) g_LogMem[16+m_Calc->m_CalcNum]=0x05000000 | __LINE__
+
+#define IsFlyOtherPlanet(ship) ((ship)->m_ArrivalTime>m_CalcTime) && (((ship)->m_FromSectorX!=(ship)->m_Planet->m_Sector->m_SectorX) || ((ship)->m_FromSectorY!=(ship)->m_Planet->m_Sector->m_SectorY) || ((ship)->m_FromPlanet!=(ship)->m_Planet->m_PlanetNum))
+#define IsFlyOtherPlanetEmp(ship) ((ship)->m_ArrivalTime>emp->m_CalcTime) && (((ship)->m_FromSectorX!=(ship)->m_Planet->m_Sector->m_SectorX) || ((ship)->m_FromSectorY!=(ship)->m_Planet->m_Sector->m_SectorY) || ((ship)->m_FromPlanet!=(ship)->m_Planet->m_PlanetNum))
+
+#define IsToLog(planet) ((m_ToLogPlanetNum>=0) && (m_ToLogSectorX==(planet)->m_Sector->m_SectorX) && (m_ToLogSectorY==(planet)->m_Sector->m_SectorY) && (m_ToLogPlanetNum==(planet)->m_PlanetNum))
+
+#define ShipOnPlanetLow(planet) (((planet)->m_Flag & PlanetFlagWormhole)?16:15)
+
+inline int StackMax(int n,int storage,int stackmax)
+{
+	if(storage<CEmpire::PlanetItemCnt) return stackmax;
+	int m,k;
+	if(CEmpire::PlanetItemCnt==16) {
+		m=storage >> 4;
+		k=storage & 15;
+	} else {
+		m=storage / CEmpire::PlanetItemCnt;
+		k=storage % CEmpire::PlanetItemCnt;
+	}
+	return stackmax*m+IF(n<k,stackmax,0);
+}
+
+inline bool IsEq(dword it,bool def=true)
+{
+	if(!it) return def;
+	if((it & 0xffff)<CEmpire::ItemTypeCnt) return false;
+	SEmpireItem * idesc=g_EMM->GetItem(it);
+	if(!idesc) return def;
+	return idesc->IsEq();
+}
+
+//CEmpire * g_Empire=NULL;
+
+int g_EmpireCnt=0;
+CEmpire * g_EmpireList[EmpireListMax]={NULL};
+
+int g_EmpireCalcCnt=0;
+CEmpireCalc * g_EmpireCalcList[EmpireCalcListMax]={NULL};
+
+const char * CEmpire::ItemTypeSysName[ItemTypeCnt]={"None","Module","Armour","Power","Repair","Jump","Build","Fuel","Double","Monuk","Antimatter","None","Metal","Electronics","Protoplasm","Nodes","Armour2","Power2","Repair2","Mine","EGM","Money","Titan","Silicon","Crystal","Xenon","Hydrogen","Food","Plasma","Machinery","Engineer","Technician","Navigator","QuarkCore"};
+
+const int CEmpire::ItemMaxLootFromAI[ItemTypeCnt]={
+	0,// ItemTypeNone=0;
+    100000,// ItemTypeModule=1;
+    1000,// ItemTypeArmour=2;
+    1000,// ItemTypePower=3;
+    1000,// ItemTypeRepair=4;
+    1000,// ItemTypeJump=5;
+    1000,// ItemTypeBuild=6;
+    1000,// ItemTypeFuel=7;
+    1000,// ItemTypeDouble=8;
+    1000,// ItemTypeMonuk=9;
+    1000,// ItemTypeAntimatter=10;
+	0,// 11
+    1000,// ItemTypeMetal=12;
+    1000,// ItemTypeElectronics=13;
+    1000,// ItemTypeProtoplasm=14;
+    0,// ItemTypeNodes=15;
+    1000,// ItemTypeArmour2=16;
+    1000,// ItemTypePower2=17;
+    1000,// ItemTypeRepair2=18;
+    1000,// ItemTypeMine=19;
+    0,// ItemTypeEGM=20;
+    10000,// ItemTypeMoney=21;
+    100000,// ItemTypeTitan=22;
+    100000,// ItemTypeSilicon=23;
+    100000,// ItemTypeCrystal=24;
+    100000,// ItemTypeXenon=25;
+    100000,// ItemTypeHydrogen=26;
+    1000,// ItemTypeFood=27;
+    1000,// ItemTypePlasma=28;
+    100,// ItemTypeMachinery=29;
+    100,// ItemTypeEngineer=30;
+    10,// ItemTypeTechnician=31;
+    10,// ItemTypeNavigator=32;
+    10,// ItemTypeQuarkCore=33;
+    1000,// ItemTypeNodeA=34;
+    1000,// ItemTypeNodeB=35;
+	1000// ItemTypeNodeC=36;
+};
+
+//													0       Transport			Corvette			Cruiser				Dreadnought				Invader				Devastator				WarBase				Shipyard			Kling0		Kling1		SciBase				Flagship,	ServiceBase,	QuarkBase
+const int CEmpire::ShipCost[ShipTypeCnt]=		{ 	0,		100,				20,					100,				150,					30,					300,					10000,				10000,				8,			80,			10000,				0,			10000,			4000000};
+const int CEmpire::ShipCostSDM[ShipTypeCnt]=	{ 	0,		10,					2,					10,					15,						3,					30,						1000,				1000,				1,			8,			1000,				1000,		1000,			100000 };
+const int CEmpire::ShipCostDir[ShipTypeCnt]=	{	0,      DirTransportPrice,	DirCorvettePrice,	DirCruiserPrice,	DirDreadnoughtPrice,	DirInvaderPrice,	DirDevastatorPrice,     DirWarBasePrice,   	DirShipyardPrice,	0,			0,			DirSciBasePrice,	0,			0,				0 };
+const int CEmpire::ShipMaxCntDir[ShipTypeCnt]=	{	0,      DirTransportCnt,	DirCorvetteCnt,		DirCruiserCnt,		DirDreadnoughtCnt,		DirInvaderCnt,		DirDevastatorCnt,		DirWarBaseCnt,   	DirShipyardCnt,		0,			0,			DirSciBaseCnt,		0,			0,				0 };
+//const int CEmpire::ShipSupplyDir[ShipTypeCnt]=	{	0,      DirTransportSupply,	DirCorvetteSupply,	DirCruiserSupply,	DirDreadnoughtSupply,	DirInvaderSupply,	DirDevastatorSupply,	DirWarBaseSupply,   DirShipyardSupply,	0,			0,			DirSciBaseSupply,	0 };
+const int CEmpire::ShipMassDir[ShipTypeCnt]=	{	0,      DirTransportMass,	DirCorvetteMass,	DirCruiserMass,		DirDreadnoughtMass,		DirInvaderMass,		DirDevastatorMass,		DirWarBaseMass,		DirShipyardMass,	0,			0,			DirSciBaseMass,		0,			0,				0 };
+//const int CEmpire::ShipFuelDir[ShipTypeCnt]=	{	0,      DirTransportFuel,	DirCorvetteFuel,	DirCruiserFuel,		DirDreadnoughtFuel,		DirInvaderFuel,		DirDevastatorFuel, 		0,   				0,					0,			0,			0,					0,			0,				0 };
+const int CEmpire::ShipArmourDir[ShipTypeCnt]=	{   0,      DirTransportArmour,	DirCorvetteArmour,	DirCruiserArmour,	DirDreadnoughtArmour,	DirInvaderArmour,	DirDevastatorArmour,	DirWarBaseArmour,  	DirShipyardArmour,	0,			0,			DirSciBaseArmour,	0,			0,				DirQuarkBaseArmour };
+const int CEmpire::ShipPowerDir[ShipTypeCnt]=	{	0,      DirTransportWeapon,	DirCorvetteWeapon,	DirCruiserWeapon,	DirDreadnoughtWeapon,	DirInvaderWeapon,	DirDevastatorWeapon,	0,  				0,					0,			0,			0,					0,			0,				DirQuarkBaseWeapon };
+const int CEmpire::ShipAccuracyDir[ShipTypeCnt]={	0,      0,					DirCorvetteAccuracy,DirCruiserAccuracy,	DirDreadnoughtAccuracy,	0,					DirDevastatorAccuracy,	DirWarBaseAccuracy,	DirShipyardAccuracy,0,			0,			DirSciBaseAccuracy,	0,			0,				DirQuarkBaseAccuracy };
+const int CEmpire::ShipAccessDir[ShipTypeCnt]=	{   0,      0,					0,					DirCruiserAccess,	DirDreadnoughtAccess,	0,					DirDevastatorAccess,	DirWarBaseAccess,  	DirShipyardAccess,	0,			0,			DirSciBaseAccess,	0,			0,				DirQuarkBaseAccess };
+const int CEmpire::ShipRepairDir[ShipTypeCnt]=	{   0,      0,					0,					0,					0,						0,					0,       				DirWarBaseRepair,  	DirShipyardRepair,	0,			0,			DirSciBaseRepair,	0,			0,				DirQuarkBaseRepair };
+const int CEmpire::ShipMaxHP[ShipTypeCnt]=		{ 	0, 		80, 				200, 				1000,				400,					80,					100,					80000,				20000,				100,		5000,		20000,				10000,		20000,			1000000 };
+const int CEmpire::ShipMaxShield[ShipTypeCnt]=	{ 	0, 		80, 				200, 				1000,				400,					80,					100,					0,					0,					0,			0,			0,					0,			0,				0 };
+const int CEmpire::ShipPower[ShipTypeCnt]=		{ 	0, 		0,					3,					1,					20,						0,					1,						500,				200,				3,			10,			200,				500,		200,			10000 };
+const int CEmpire::ShipScore[ShipTypeCnt]=		{ 	0, 		1,					1,					2,					2,						1,					2,						100,				100,				0,			0,			100,				300,		100,			5000 };
+//const int CEmpire::ShipSupplyA[ShipTypeCnt]=	{	0,		0,					0,					1,					8,						0,					4,						5,					20,					0,			0,			10,					0 };
+//const int CEmpire::ShipSupplyM[ShipTypeCnt]=	{	0,		0,					1,					3,					2,						4,					2,						5,					20,					0,			0,			10,					0 };
+//const int CEmpire::ShipSupplyE[ShipTypeCnt]=	{	0,		1,					0,					1,					8,						0,					5,						5,					20,					0,			0,			10,					0 };
+//const int CEmpire::ShipSupplyS[ShipTypeCnt]=	{	0,		8,					8,					8,					8,						8,					8,						6,					0,					0,			0,			0,					0 };
+const int CEmpire::ShipToBattle[ShipTypeCnt]=	{	0,		0,					2,					7,					3,						1,					3,						5,					4,					9,			9,			4,					6,			4,				5 };
+const int CEmpire::ShipBuildSpeed[ShipTypeCnt]=	{	0,      -2,         		1,					3,					3,						1,					3,						10,					10,					0,			0,			9,					12,			10,				14 };
+const bool CEmpire::ShipIsBase[ShipTypeCnt]=	{ 	false,	false,				false,				false,				false,					false,				false,					true,				true,				false,		false,		true,				false,		true,			true };
+const bool CEmpire::ShipLowOrbit[ShipTypeCnt]=	{ 	false,	true,				false,				false,				false,					false,				false,					false,				true,				false,		false,		true,				false,		true,			false };
+const bool CEmpire::ShipAtkMass[ShipTypeCnt]=	{ 	false,	false,				true,				true,				true,					true,				true,					false,				false,				true,		true,		false,				true,		false,			true };
+const int CEmpire::ShipHitPriorCorvette[ShipTypeCnt] ={0,   8,                  5,                  4,                  9,                      7,                  9,                      4,                  8,					2,          1,          8,                  6,          8,              6};
+
+
+/*const int CEmpire::ItemBuildFactor[ItemTypeCnt] = {
+1000000*CLOCKS_PER_SEC,	// ItemTypeNone
+120*CLOCKS_PER_SEC,	// ItemTypeModule
+120*CLOCKS_PER_SEC,	// ItemTypeArmour
+120*CLOCKS_PER_SEC,	// ItemTypePower
+120*CLOCKS_PER_SEC,	// ItemTypeRepair
+120*CLOCKS_PER_SEC,	// ItemTypeJump
+120*CLOCKS_PER_SEC,	// ItemTypeBuild
+240*CLOCKS_PER_SEC,	// ItemTypeFuel
+120*CLOCKS_PER_SEC,	// ItemTypeDouble
+120*CLOCKS_PER_SEC	// ItemTypeMonuk
+};*/
+
+const int FinalPower[]={
+0,
+1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,44,45,46,47,48,49,50,51,52,53,54
+,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,98,99
+,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,130,131,132,133,134,135,136
+,137,138,139,140,141,142,143,143,144,145,146,147,148,149,150,151,152,153,154,155,155,156,157,158,159,160,161,162,163,164,165,166,166,167,168,169,170,171,172
+,173,174,175,176,176,177,178,179,180,181,182,183,184,185,185,186,187,188,189,190,191,192,193,194,194,195,196,197,198,199,200,201,202,203,203,204,205,206,207
+,208,209,210,211,211,212,213,214,215,216,217,218,219,219,220,221,222,223,224,225,226,226,227,228,229,230,231,232,233,233,234,235,236,237,238,239,240,240,241
+,242,243,244,245,246,247,247,248,249,250,251,252,253,254,254,255,256,257,258,259,260,260,261,262,263,264,265,266,266,267,268,269,270,271,272,272,273,274,275
+,276,277,278,278,279,280,281,282,283,283,284,285,286,287,288,289,289,290,291,292,293,294,294,295,296,297,298,299,299,300,301,302,303,304,304,305,306,307,308
+,309,309,310,311,312,313,314,314,315,316,317,318,319,319,320,321,322,323,323,324,325,326,327,328,328,329,330,331,332,333,333,334,335,336,337,337,338,339,340
+,341,341,342,343,344,345,346,346,347,348,349,350,350,351,352,353,354,354,355,356,357,358,358,359,360,361,362,362,363,364,365,366,366,367,368,369,370,370,371
+,372,373,374,374,375,376,377,377,378,379,380,381,381,382,383,384,385,385,386,387,388,388,389,390,391,392,392,393,394,395,395,396,397,398,399,399,400,401,402
+,402,403,404,405,406,406,407,408,409,409,410,411,412,412,413,414,415,416,416,417,418,419,419,420,421,422,422,423,424,425,425,426,427,428,428,429,430,431,431
+,432,433,434,434,435,436,437,438,438,439,440,440,441,442,443,443,444,445,446,446,447,448,449,449,450,451,452,452,453,454,455,455,456,457,458,458,459,460,461
+,461,462,463,463,464,465,466,466,467,468,469,469,470,471,471,472,473,474,474,475,476,477,477,478,479,479,480,481,482,482,483,484,484,485,486,487,487,488,489
+,489,490,491,492,492,493,494,494,495,496,497,497,498,499,499,500,501,502,502,503,504,504,505,506,506,507,508,509,509,510,511,511,512,513,513,514,515,516,516
+,517,518,518,519,520,520,521,522,523,523,524,525,525,526,527,527,528,529,529,530,531,531,532,533,534,534,535,536,536,537,538,538,539,540,540,541,542,542,543
+,544,544,545,546,546,547,548,548,549,550,550,551,552,552,553,554,554,555,556,556,557,558,558,559,560,560,561,562,562,563,564,564,565,566,566,567,568,568,569
+,570,570,571,572,572,573,574,574,575,576,576,577,578,578,579,579,580,581,581,582,583,583,584,585,585,586,587,587,588,588,589,590,590,591,592,592,593,594,594
+,595,596,596,597,597,598,599,599,600,601,601,602,602,603,604,604,605,606,606,607,607,608,609,609,610,611,611,612,612,613,614,614,615,616,616,617,617,618,619
+,619,620,621,621,622,622,623,624,624,625,625,626,627,627,628,629,629,630,630,631,632,632,633,633,634,635,635,636,636,637,638,638,639,639,640,641,641,642,642
+,643,644,644,645,645,646,647,647,648,648,649,650,650,651,651,652,652,653,654,654,655,655,656,657,657,658,658,659,660,660,661,661,662,662,663,664,664,665,665
+,666,666,667,668,668,669,669,670,671,671,672,672,673,673,674,675,675,676,676,677,677,678,679,679,680,680,681,681,682,682,683,684,684,685,685,686,686,687,688
+,688,689,689,690,690,691,691,692,693,693,694,694,695,695,696,696,697,698,698,699,699,700,700,701,701,702,702,703,704,704,705,705,706,706,707,707,708,708,709
+,709,710,711,711,712,712,713,713,714,714,715,715,716,716,717,718,718,719,719,720,720,721,721,722,722,723,723,724,724,725,725,726,726,727,728,728,729,729,730
+,730,731,731,732,732,733,733,734,734,735,735,736,736,737,737,738,738,739,739,740,740,741,741,742,742,743,743,744,744,745,745,746,746,747,747,748,748,749,749
+,750,750,751,751,752,752,753,753,754,754,755,755,756,756,757,757,758,758,759,759,760,760,761,761,762,762,763,763,764,764,765,765,766,766,767,767,768,768,769
+,769,770,770,771,771,772,772,772,773,773,774,774,775,775,776,776,777,777,778,778,779,779,780,780,781,781,781,782,782,783,783,784,784,785,785,786,786,787,787
+,787,788,788,789,789,790,790,791,791,792,792,793,793,793,794,794,795,795,796,796,797,797,798,798,798,799,799,800,800,801,801,802,802,802,803,803,804,804,805
+,805,806,806,806,807,807,808,808,809,809,809,810,810,811,811,812,812,813,813,813,814,814,815,815,816,816,816,817,817,818,818,819,819,819,820,820,821,821,821
+,822,822,823,823,824,824,824,825,825,826,826,827,827,827,828,828,829,829,829,830,830,831,831,831,832,832,833,833,834,834,834,835,835,836,836,836,837,837,838
+,838,838,839,839,840,840,840,841,841,842,842,842,843,843,844,844,844,845,845,846,846,846,847,847,848,848,848,849,849,849,850,850,851,851,851,852,852,853,853
+,853,854,854,854,855,855,856,856,856,857,857,857,858,858,859,859,859,860,860,860,861,861,862,862,862,863,863,863,864,864,865,865,865,866,866,866,867,867,868
+,868,868,869,869,869,870,870,870,871,871,871,872,872,873,873,873,874,874,874,875,875,875,876,876,876,877,877,878,878,878,879,879,879,880,880,880,881,881,881
+,882,882,882,883,883,883,884,884,884,885,885,885,886,886,886,887,887,887,888,888,888,889,889,889,890,890,890,891,891,891,892,892,892,893,893,893,894,894,894
+,895,895,895,896,896,896,897,897,897,898,898,898,899,899,899,900,900,900,900,901,901,901,902,902,902,903,903,903,904,904,904,905,905,905,905,906,906,906,907
+,907,907,908,908,908,908,909,909,909,910,910,910,911,911,911,911,912,912,912,913,913,913,914,914,914,914,915,915,915,916,916,916,916,917,917,917,918,918,918
+,918,919,919,919,920,920,920,920,921,921,921,922,922,922,922,923,923,923,924,924,924,924,925,925,925,925,926,926,926,927,927,927,927,928,928,928,928,929,929
+,929,930,930,930,930,931,931,931,931,932,932,932,932,933,933,933,933,934,934,934,934,935,935,935,935,936,936,936,936,937,937,937,938,938,938,938,938,939,939
+,939,939,940,940,940,940,941,941,941,941,942,942,942,942,943,943,943,943,944,944,944,944,945,945,945,945,945,946,946,946,946,947,947,947,947,948,948,948,948
+,948,949,949,949,949,950,950,950,950,950,951,951,951,951,952,952,952,952,952,953,953,953,953,954,954,954,954,954,955,955,955,955,955,956,956,956,956,957,957
+,957,957,957,958,958,958,958,958,959,959,959,959,959,960,960,960,960,960,961,961,961,961,961,962,962,962,962,962,963,963,963,963,963,964,964,964,964,964,964
+,965,965,965,965,965,966,966,966,966,966,967,967,967,967,967,967,968,968,968,968,968,968,969,969,969,969,969,970,970,970,970,970,970,971,971,971,971,971,971
+,972,972,972,972,972,972,973,973,973,973,973,973,974,974,974,974,974,974,975,975,975,975,975,975,976,976,976,976,976,976,976,977,977,977,977,977,977,978,978
+,978,978,978,978,978,979,979,979,979,979,979,979,980,980,980,980,980,980,980,981,981,981,981,981,981,981,982,982,982,982,982,982,982,982,983,983,983,983,983
+,983,983,983,984,984,984,984,984,984,984,984,985,985,985,985,985,985,985,985,986,986,986,986,986,986,986,986,987,987,987,987,987,987,987,987,987,988,988,988
+,988,988,988,988,988,988,989,989,989,989,989,989,989,989,989,989,990,990,990,990,990,990,990,990,990,990,991,991,991,991,991,991,991,991,991,991,992,992,992
+,992,992,992,992,992,992,992,992,993,993,993,993,993,993,993,993,993,993,993,993,994,994,994,994,994,994,994,994,994,994,994,994,994,995,995,995,995,995,995
+,995,995,995,995,995,995,995,995,996,996,996,996,996,996,996,996,996,996,996,996,996,996,996,996,997,997,997,997,997,997,997,997,997,997,997,997,997,997,997
+,997,997,997,998,998,998,998,998,998,998,998,998,998,998,998,998,998,998,998,998,998,998,998,998,998,998,999,999,999,999,999,999,999,999,999,999,999,999,999
+,999,999,999,999,999,999,999,999,999,999,999,999,999,999,999,999,999,999,999,999,1000
+};
+const int FinalPowerCnt=sizeof(FinalPower)/sizeof(FinalPower[0]);
+
+int ShieldFactor[101]={
+0,4096,2048,1366,1024,820,683,586,512,456,410,373,342,316,293,274,256,241,228,216,205,196,187,179,171,164,158,152,147,142,137,133,128,125,121,118,114
+,111,108,106,103,100,98,96,94,92,90,88,86,84,82,81,79,78,76,75,74,72,71,70,69,68,67,66,64,64,63,62,61,60,59,58,57,57,56,55,54,54,53,52,52,51,50,50,49,49
+,48,48,47,47,46,46,45,45,44,44,43,43,42,42,41};
+
+const int CEmpire::TechDir[]={
+//Progress
+		DirEmpireMax,		DirShipSpeed,		DirPlanetProtect,		DirShipMassMax,
+		DirCaptureSlow,		DirColonyMax,		DirPlanetProtect,		0,
+		DirEmpireMax,		0,					DirPlanetProtect,		DirShipMassMax,
+		DirEmpireMax,		DirColonyMax,		DirEnclaveMax,			DirShipMassMax,
+		DirCaptureSlow,		DirShipSpeed,		DirEnclaveMax,			0,
+		DirCaptureSlow,		DirColonyMax,		DirPlanetProtect,		DirShipMassMax,
+		DirEmpireMax,		0,					DirEnclaveMax,			0,
+		DirCaptureSlow,		DirColonyMax,		DirEnclaveMax,			DirShipMassMax
+		,
+// Economy
+		0,					0,					0,						0,
+		0,					0,					0,						0,
+		0,					0,					0,						0,
+		0,					0,					0,						0,
+		0,					0,					0,						0,
+		0,					0,					0,						0,
+		0,					0,					0,						0,
+		0,					0,					0,						0
+		,
+//		DirModuleSpeed,		DirSupplyNormal,	0,						DirResMax,
+//		DirModuleMax,		DirSupplyNormal,	DirPlanetLavelCost,		DirResSpeed,
+//		DirModuleSpeed,		DirSupplyNormal,	0,						DirResSpeed,
+//		DirModuleMax,		DirSupplyNormal,	DirPlanetLavelCost,		DirResMax,
+//		DirModuleSpeed,		DirSupplyMuch,		DirCitadelCost,			DirResSpeed,
+//		DirModuleMax,		DirSupplyMuch,		DirPlanetLavelCost,		DirResMax,
+//		DirModuleMax,		DirSupplyMuch,		DirCitadelCost,			DirResMax,
+//		DirModuleSpeed,		DirSupplyMuch,		DirPlanetLavelCost,		DirResSpeed
+//		,
+// Transport
+		DirTransportPrice,	DirTransportCnt,	DirTransportCargo,		DirTransportArmour,
+		0,					DirTransportCnt,	DirTransportCargo,		0,
+		DirTransportPrice,	DirTransportMass,	0,						DirTransportArmour,
+		0,					0,					DirTransportCargo,		DirTransportArmour,
+		DirTransportPrice,	DirTransportCnt,	0,						DirTransportWeapon,
+		0,					DirTransportCnt,	DirTransportCargo,		0,
+		DirTransportPrice,	0,					DirTransportCargo,		DirTransportArmour,
+		0,					DirTransportMass,	DirTransportCargo,		DirTransportWeapon
+		,
+// Corvette
+		DirCorvettePrice,	DirCorvetteCnt,		DirCorvetteWeapon,		DirCorvetteArmour,
+		0,					DirCorvetteCnt,		DirCorvetteAccuracy,	0,
+		DirCorvettePrice,	DirCorvetteMass,	DirCorvetteAccuracy,	DirCorvetteArmour,
+		0,					DirCorvetteMass,	DirCorvetteWeapon,		DirCorvetteArmour,
+		0,					DirCorvetteCnt,		DirCorvetteAccuracy,	0,
+		DirCorvettePrice,	DirCorvetteCnt,		DirCorvetteWeapon,		DirCorvetteArmour,
+		DirCorvettePrice,	0,					DirCorvetteAccuracy,	DirCorvetteArmour,
+		0,					DirCorvetteStealth,	DirCorvetteAccuracy,	0
+		,
+// Cruiser
+		DirCruiserAccess,	DirCruiserCnt,		DirCruiserAccuracy,		0,
+		DirCruiserPrice,	DirCruiserCnt,		DirCruiserWeapon,		DirCruiserArmour,
+		0,					DirCruiserMass,		DirCruiserWeapon,		DirCruiserArmour,
+		DirCruiserPrice,	DirCruiserMass,		DirCruiserAccuracy,		DirCruiserArmour,
+		0,					DirCruiserCnt,		DirCruiserWeapon,		DirCruiserArmour,
+		DirCruiserPrice,	DirCruiserCnt,		DirCruiserWeapon,		0,
+		DirCruiserPrice,	DirCruiserMass,		DirCruiserAccuracy,		DirCruiserArmour,
+		0,					0,					DirCruiserWeapon,		DirCruiserArmour
+		,
+// Dreadnought
+		DirDreadnoughtAccess,	0,						DirDreadnoughtAccuracy,		0,
+		DirDreadnoughtPrice,	DirDreadnoughtCnt,		0,							DirDreadnoughtArmour,
+		0,						DirDreadnoughtMass,		DirDreadnoughtAccuracy,		DirDreadnoughtArmour,
+		DirDreadnoughtPrice,	DirDreadnoughtMass,		DirDreadnoughtAccuracy,		0,
+		0,						DirDreadnoughtCnt,		0,							DirDreadnoughtWeapon,
+		DirDreadnoughtPrice,	DirDreadnoughtCnt,		0,							DirDreadnoughtWeapon,
+		DirDreadnoughtPrice,	DirDreadnoughtCnt,		DirDreadnoughtAccuracy,		DirDreadnoughtArmour,
+		0,						0,						DirDreadnoughtAccuracy,		0
+		,
+// Invader
+		DirInvaderPrice,	DirInvaderCnt,		DirInvaderCaptureSpeed,			DirInvaderArmour,
+		0,					DirInvaderCnt,		DirInvaderCaptureSpeed,			0,
+		DirInvaderPrice,	DirInvaderMass,		0,								DirInvaderArmour,
+		0,					DirInvaderMass,		DirInvaderCaptureSpeed,			DirInvaderArmour,
+		0,					DirInvaderCnt,		DirInvaderCaptureSpeed,			DirInvaderWeapon,
+		DirInvaderPrice,	DirInvaderCnt,		0,								0,
+		DirInvaderPrice,	0,					DirInvaderCaptureSpeed,			DirInvaderArmour,
+		0,					0,					DirInvaderCaptureSpeed,			DirInvaderWeapon
+		,
+// Devastator
+		DirDevastatorAccess,	0,						DirDevastatorAccuracy,		DirDevastatorBomb,
+		DirDevastatorPrice,		DirDevastatorCnt,		DirDevastatorWeapon,		DirDevastatorBomb,
+		0,						DirDevastatorMass,		DirDevastatorAccuracy,		DirDevastatorArmour,
+		DirDevastatorPrice,		DirDevastatorCnt,		DirDevastatorWeapon,		DirDevastatorBomb,
+		0,						DirDevastatorCnt,		DirDevastatorAccuracy,		DirDevastatorArmour,
+		DirDevastatorPrice,		DirDevastatorMass,		DirDevastatorAccuracy,		DirDevastatorBomb,
+		DirDevastatorPrice,		DirDevastatorCnt,		DirDevastatorWeapon,		DirDevastatorArmour,
+		0,						0,						DirDevastatorAccuracy,		DirDevastatorBomb
+		,
+// WarBase
+		DirWarBaseAccess,	DirWarBaseCnt,		0,						0,
+		DirWarBasePrice,	0,					DirWarBaseRepair,		DirWarBaseArmour,
+		0,					DirWarBaseCnt,		DirWarBaseRepair,		DirWarBaseArmour,
+		DirWarBasePrice,	DirWarBaseMass,		DirWarBaseAccuracy,		DirWarBaseArmourAll,
+		0,					DirWarBaseMass,		DirWarBaseRepair,		DirWarBaseArmour,
+		DirWarBasePrice,	DirWarBaseCnt,		DirWarBaseRepair,		DirWarBaseArmourAll,
+		DirWarBasePrice,	DirWarBaseCnt,		DirWarBaseAccuracy,		DirWarBaseArmourAll,
+		0,					0,					DirWarBaseAccuracy,		DirWarBaseArmour
+		,
+// Shipyard
+		DirShipyardAccess,		DirShipyardMass,	0,						0,
+		DirShipyardPrice,		0,					DirShipyardRepair,		DirShipyardArmour,
+		0,						DirShipyardCnt,		DirShipyardRepair,		DirShipyardRepairAll,
+		DirShipyardPrice,		DirShipyardMass,	DirShipyardAccuracy,	DirShipyardArmour,
+		0,						DirShipyardMass,	DirShipyardRepair,		DirShipyardArmour,
+		DirShipyardPrice,		DirShipyardMass,	DirShipyardRepair,		DirShipyardRepairAll,
+		DirShipyardPrice,		DirShipyardCnt,		DirShipyardAccuracy,	0,
+		0,						0,					DirShipyardAccuracy,	DirShipyardRepairAll
+		,
+// SciBase
+		DirSciBaseAccess,		0,					DirSciBaseRepair,		0,
+		DirSciBasePrice,		DirSciBaseCnt,		DirSciBaseRepair,		DirSciBaseArmour,
+		0,						DirSciBaseMass,		DirSciBaseAccuracy,		0,
+		DirSciBasePrice,		DirSciBaseMass,		DirSciBaseAccuracy,		DirSciBaseArmour,
+		0,						DirSciBaseMass,		DirSciBaseRepair,		DirSciBaseArmour,
+		DirSciBasePrice,		DirSciBaseMass,		DirSciBaseRepair,		0,
+		DirSciBasePrice,		DirSciBaseCnt,		DirSciBaseAccuracy,		0,
+		0,						0,					DirSciBaseStabilizer,	0
+		,
+// QuarkBase
+        DirQuarkBaseAccess,     DirQuarkBaseBlackHole,	DirQuarkBaseWeapon,     DirQuarkBaseArmour,
+        DirQuarkBaseShieldInc,  DirQuarkBaseHP,         DirQuarkBaseAccuracy,   DirQuarkBaseAntiGravitor,
+        DirQuarkBaseShieldInc,  DirQuarkBaseShield,     DirQuarkBaseRepair,     DirQuarkBaseShieldReduce,
+        DirQuarkBaseGravWell,   DirQuarkBaseAntiShield, DirQuarkBaseRepair,		DirQuarkBaseAntiGravitor,
+        DirQuarkBaseShieldInc,  DirQuarkBaseHP,     	DirQuarkBaseAccuracy,   DirQuarkBaseAntiGravitor,
+        DirQuarkBaseGravWell,   DirQuarkBaseAntiShield, DirQuarkBaseRepair,     DirQuarkBaseShieldReduce,
+        0,                      DirQuarkBaseShield,		DirQuarkBaseWeapon,     DirQuarkBaseArmour,
+        DirQuarkBaseGravWell,   DirQuarkBaseAntiShield, DirQuarkBaseBlackHole,	DirQuarkBaseAntiGravitor
+};
+
+const int CEmpire::TechCost[]=
+{
+0, 0, 0, 0, 0, 0, // Progress
+0, 0, 0, 0, 0, 0, // Economy
+0, 0, 0, 1, 0, 0, // Transport
+0, 0, 0, 1, 0, 0, // Corvette
+0, 0, 0, 2, 0, 0, // Cruiser
+0, 0, 0, 2, 0, 0, // Dreadnought
+0, 0, 0, 2, 0, 0, // Invader
+0, 0, 0, 2, 0, 0, // Devastator
+0, 0, 0, 3, 0, 0, // WarBase
+0, 0, 0, 3, 0, 0, // Shipyard
+0, 0, 0, 3, 0, 0, // SciBase
+0, 0, 0,10, 0, 1  // QuarkBase
+};
+
+const int CEmpire::DirEmpireMaxLvl[5]={ 40, 60, 90, 120, 150 };
+const int CEmpire::DirEnclaveMaxLvl[5]={ 5, 20, 40, 60, 100 };
+const int CEmpire::DirColonyMaxLvl[5]={ 5, 10, 15, 20, 30 };
+//const int CEmpire::DirPlanetLevelMaxLvl[6]={ 399, 499, 599, 699, 899, 999 };
+const int CEmpire::DirShipMassMaxLvlEmp[6]={8000, 10000, 12000, 14000, 16000, 18000};//{5000, 7000, 9000, 11000, 13000, 15000};//{6000, 8000, 11000, 14000, 17000, 20000};
+const int CEmpire::DirShipMassMaxLvlEnc[6]={2500, 3000, 3500, 4000, 4500, 5000};//{1200, 1700, 2200, 2800, 3500, 4000};
+const int CEmpire::DirShipMassMaxLvlDef[6]={4000, 5000, 7000, 9000, 11000, 13000};
+//int DirShipSpeedLvl[3]={ 75, 100, 125 };
+const int CEmpire::DirShipSpeedLvlRC[3]={ 30, 40, 50 };
+//int DirPlanetProtectLvl[5]={ 0, 2, 4, 6, 8 };
+const int CEmpire::DirPlanetProtectLvlRC[5]={ 0, 5, 10, 15, 20 };
+//int DirCaptureSlowLvl[5]={ 0, 25, 50, 75, 100 };
+const int CEmpire::DirCaptureSlowLvlRC[5]={5,6,7,8,10};//{ 10, 12,  15,  17,  20  };//{ 40, 50, 60, 70, 80 };
+
+//int DirModuleSpeedLvl[5]={ 20,19,18,17,16 };
+//int DirModuleSpeedLvlRC[5]={ 20*TNQ_PER_SEC,19*TNQ_PER_SEC,18*TNQ_PER_SEC,17*TNQ_PER_SEC,16*TNQ_PER_SEC };
+//int DirResSpeedLvl[5]={ 100,105,110,115,120 };
+//int DirResSpeedLvlRC[5]={ 0,12,25,38,51 };
+//int DirSupplyNormalLvl[5]={1000, 2000, 4000, 6000, 8000};//{ 500, 800, 1200, 1500, 2000 };
+//int DirSupplyMuchLvl[5]={ 30000, 40000, 60000, 80000, 100000 };//{ 30000, 40000, 50000, 60000, 70000 };
+//int DirModuleMaxLvl[5]={ 60000, 90000, 130000, 170000, 200000 };
+//int DirResMaxLvl[5]={ 100000, 500000, 1000000, 10000000, 30000000 };
+//int DirCitadelCostLvl[3]={ 200000, 100000, 50000 };
+//int DirPlanetLavelCostLvl[5]={ 300, 260, 220, 170, 150 };
+
+const int ModuleMaxMul=5;
+
+int DirTransportPriceLvl[5]={160,140,120,100,80};
+int DirTransportCntLvl[5]={199,399,599,799,999};
+//int DirTransportSupplyLvl[3]={512,384,256};
+int DirTransportMassLvl[3]={50,40,30};
+//int DirTransportFuelLvl[3]={20,40,60};
+int DirTransportArmourLvl[5]={0, 8, 15, 20, 26};
+int DirTransportWeaponLvl[3]={0,1,2};
+int DirTransportCargoLvl[7]={40,60,100,150,200,300,500};
+
+int DirCorvettePriceLvl[5]={100, 90, 80, 70, 60};//{50,45,40,35,30};
+int DirCorvetteCntLvl[5]={199,399,599,799,999};
+//int DirCorvetteSupplyLvl[3]={512,384,256};
+int DirCorvetteMassLvl[3]={20,15,10};//{10,7,5};
+//int DirCorvetteFuelLvl[3]={20,40,60};
+int DirCorvetteArmourLvl[6]={13, 15, 18, 20, 23, 26};//{0, 5, 10, 15, 20, 26};
+int DirCorvetteWeaponLvl[4]={3,4,5,6};
+int DirCorvetteAccuracyLvl[6]={64, 77, 90, 102, 115, 128};//{0,21,42,85,106,128};//{0, 64, 128, 256, 320, 384};//{0,128,256,512,640,768};
+int DirCorvetteStealthLvl[2]={0,1};
+
+int DirCruiserAccessLvl[2]={0,1};
+int DirCruiserPriceLvl[5]={300,250,200,150,100};
+const int CEmpire::DirCruiserCntLvl[5]={199,399,599,799,999};
+//int DirCruiserSupplyLvl[4]={640,512,384,256};
+int DirCruiserMassLvl[4]={20,17,14,10};
+//int DirCruiserFuelLvl[3]={20,40,60};
+int DirCruiserArmourLvl[7]={23, 26, 28, 31, 33, 36, 38};//{0, 5, 8, 15, 23, 30, 38};
+int DirCruiserWeaponLvl[6]={1,2,3,4,5,6};
+int DirCruiserAccuracyLvl[4]={77, 115, 154, 192};//{0, 64, 128, 192};//{0,128,256,384};
+
+int DirDreadnoughtAccessLvl[2]={0,1};
+int DirDreadnoughtPriceLvl[5]={350,300,250,200,150};//{450,400,350,300,250};
+const int CEmpire::DirDreadnoughtCntLvl[5]={199,399,599,799,999};
+//int DirDreadnoughtSupplyLvl[3]={512,384,256};
+int DirDreadnoughtMassLvl[3]={25, 20, 15};//{70,55,40};
+//int DirDreadnoughtFuelLvl[3]={20,40,60};
+int DirDreadnoughtArmourLvl[4]={23, 28, 33, 38};//{0, 13, 26, 38};
+int DirDreadnoughtWeaponLvl[3]={10,20,30};
+int DirDreadnoughtAccuracyLvl[6]={192, 230, 269, 307, 346, 384};//{0, 64, 128, 256, 320, 384};//{0,128,256,512,640,768};
+
+int DirInvaderPriceLvl[5]={50,45,40,35,30};
+int DirInvaderCntLvl[5]={199,399,599,799,999};
+//int DirInvaderSupplyLvl[3]={512,384,256};
+int DirInvaderMassLvl[3]={20,15,10};
+//int DirInvaderFuelLvl[3]={20,40,60};
+int DirInvaderArmourLvl[5]={0, 8, 15, 20, 26};
+int DirInvaderWeaponLvl[3]={0,1,2};
+int DirInvaderCaptureSpeedLvl[7]=  {179, 198, 223, 256, 295, 359, 449}; // ((max-((max-min)>>1))/v)*256 ;//{154, 179, 205, 230, 256, 282, 307}; //{0,51,102,154,204,256,307};
+int DirInvaderCaptureSpeedLvlRC[7]={256, 230, 205, 179, 154, 128, 102};//{256, 243, 230, 218, 205, 192, 179};//{256,213,183,160,142,128,116};
+
+int DirDevastatorAccessLvl[2]={0,1};
+int DirDevastatorPriceLvl[5]={700,600,500,400,300};//{350,300,250,200,150};
+int DirDevastatorCntLvl[5]={199,399,599,799,999};
+//int DirDevastatorSupplyLvl[3]={512,384,256};
+int DirDevastatorMassLvl[3]={30,25,20};//{25,20,15};
+//int DirDevastatorFuelLvl[3]={20,40,60};
+int DirDevastatorArmourLvl[4]={0, 8, 15, 23};
+int DirDevastatorWeaponLvl[4]={5,6,7,8};
+int DirDevastatorAccuracyLvl[6]={102, 120, 138, 156, 174, 192};//{0, 64, 90, 115, 154, 192};//{0,128,179,230,307,384};
+int DirDevastatorAccuracyHitLvl[6]={141, 154, 166, 179, 192, 205};//{102,115,128,153,179,205};
+int DirDevastatorBombLvl[6]={350,400,450,500,550,600};
+
+int DirWarBaseAccessLvl[2]={0,1};
+int DirWarBasePriceLvl[5]={30000,25000,20000,15000,10000};
+int DirWarBaseCntLvl[5]={1,2,5,10,20};
+//int DirWarBaseSupplyLvl[3]={512,384,256};
+int DirWarBaseMassLvl[3]={500,400,250};
+int DirWarBaseArmourLvl[5]={15, 18, 20, 23, 26};//{0, 8, 15, 20, 26};
+int DirWarBaseAccuracyLvl[4]={192, 256, 320, 384};//{0, 128, 256, 384};//{0, 64, 128, 192};
+int DirWarBaseRepairLvl[5]={10,15,20,25,30};
+int DirWarBaseArmourAllLvl[4]={0,10,18,26};
+
+int DirShipyardAccessLvl[2]={0,1};
+int DirShipyardPriceLvl[5]={30000,25000,20000,15000,10000};
+int DirShipyardCntLvl[3]={1,2,4};
+//int DirShipyardSupplyLvl[5]={768,640,512,384,256};
+int DirShipyardMassLvl[5]={30000,25000,20000,15000,10000};
+int DirShipyardArmourLvl[4]={0, 8, 15, 23};
+int DirShipyardAccuracyLvl[4]={0, 64, 128, 192};//{0,128,256,384};
+int DirShipyardRepairLvl[5]={10,15,20,25,30};
+int DirShipyardRepairAllLvl[4]={0,100,150,250};
+
+int DirSciBaseAccessLvl[2]={0,1};
+int DirSciBasePriceLvl[5]={30000,25000,20000,15000,10000};
+int DirSciBaseCntLvl[3]={1,2,4};
+//int DirSciBaseSupplyLvl[5]={768,640,512,384,256};
+int DirSciBaseMassLvl[5]={900,800,700,600,500};
+int DirSciBaseArmourLvl[4]={0, 8, 15, 23};
+int DirSciBaseAccuracyLvl[4]={0, 64, 128, 192};//{0,128,256,384};
+int DirSciBaseRepairLvl[5]={10,15,20,25,30};
+int DirSciBaseStabilizerLvl[2]={100,70};
+int DirSciBaseStabilizerLvlRC[2]={3,2};
+
+int DirQuarkBaseAccessLvl[2]={0,1};
+//int DirQuarkBaseMassLvl[5]={600000,550000,500000,450000,400000};
+int DirQuarkBaseWeaponLvl[3]={5000,8000,10000};
+int DirQuarkBaseAccuracyLvl[3]={0, 64, 128};//{0,128,256};
+int DirQuarkBaseArmourLvl[3]={0,26,51};//{0,51,102};
+int DirQuarkBaseRepairLvl[4]={50,500,1000,2000};
+int DirQuarkBaseAntiGravitorLvl[5]={0,20,15,10,5};
+int DirQuarkBaseGravWellLvl[4]={0,55,35,15};
+int DirQuarkBaseBlackHoleLvl[4]={0, 30, 10};//{0, 70, 50, 30};//{0,55,35,15};
+int DirQuarkBaseHPLvl[3]={500000,1000000,2000000};
+int DirQuarkBaseShieldLvl[3]={500000,1000000,2000000};
+int DirQuarkBaseShieldReduceLvl[3]={0,26,51};//{0,51,102};
+int DirQuarkBaseShieldIncLvl[4]={25, 250, 500, 750};
+int DirQuarkBaseAntiShieldLvl[4]={0, 30, 15, 5};
+
+const int CEmpire::ResearchPeriod[]={50,100,150,200,300,500,800,1200,1700,2300,3000,3800,4700};
+
+const int CEmpire::TalentVec[]={
+// Move
+		0,					VecMoveSpeed,			VecMoveGravitor,		0,
+		VecMoveCover,		VecMoveAccelerator,		VecMoveGravitor,		VecMovePortal,
+		0,					VecMoveIntercept,		VecMoveRadar,			VecMovePortal,
+		VecMoveCover,		VecMoveAccelerator,		VecMoveRadar,			0,
+		0,					0,						VecMoveRadar,			VecMovePortal,
+		VecMoveCover,		VecMoveAccelerator,		VecMoveGravitor,		VecMovePortal,
+		0,					VecMoveSpeed,			VecMoveRadar,			VecMovePortal,
+		VecMoveCover,		VecMoveAccelerator,		VecMoveRadar,			VecMoveExchange
+		,
+// Protect 
+		VecProtectHP,		VecProtectShield,			VecProtectArmour,		VecProtectShieldInc,
+		VecProtectHP,		VecProtectShield,			VecProtectShieldReduce,	VecProtectRepair,
+		VecProtectHP,		VecProtectShield,			VecProtectShieldReduce,	VecProtectRepair,
+		0,					VecProtectInvulnerability,	VecProtectArmour,		VecProtectShieldInc,
+		VecProtectHP,		VecProtectShield,			VecProtectShieldReduce,	VecProtectRepair,
+		VecProtectHP,		VecProtectShield,			VecProtectShieldReduce,	VecProtectRepair,
+		VecProtectHP,		VecProtectShield,			VecProtectArmour,		VecProtectShieldInc,
+	VecProtectAntiExchange,	VecProtectInvulnerability,	VecProtectArmour,		VecProtectShieldInc
+		,
+// Attack 
+		VecAttackCannon,	VecAttackLaser,		VecAttackMissile,			0,
+		0,					VecAttackLaser,		VecAttackMine,				VecAttackAccuracy,
+		VecAttackCannon,	0,					VecAttackMissile,			VecAttackAccuracy,
+		VecAttackCannon,	VecAttackLaser,		VecAttackMissile,			0,
+		0,					VecAttackLaser,		VecAttackMine,				VecAttackAccuracy,
+		VecAttackCannon,	0,					VecAttackMissile,			VecAttackAccuracy,
+		VecAttackCannon,	VecAttackLaser,		VecAttackMine,				0,
+		0,					0,					VecAttackMine,				0
+		,
+// System
+		VecSystemHacker,	VecSystemRecharge,		VecSystemSensor,		VecAttackTransiver,
+		VecSystemHacker,	VecSystemRecharge,		VecSystemJummer,		VecSystemConstructor,
+		VecSystemHacker,	VecSystemDisintegrator,	VecSystemJummer,		VecSystemConstructor,
+		VecSystemStealth,	VecSystemRecharge,		VecSystemSensor,		VecAttackTransiver,
+		VecSystemHacker,	VecSystemDisintegrator,	VecSystemJummer,		VecSystemConstructor,
+		VecSystemHacker,	VecSystemRecharge,		VecSystemSensor,		VecAttackTransiver,
+		VecSystemHacker,	VecSystemDisintegrator,	VecSystemJummer,		VecSystemConstructor,
+		VecSystemStealth,	0,						VecSystemSensor,		VecAttackTransiver
+};
+
+int VecMoveSpeedLvl[]={75, 100, 125};
+//int VecMoveFuelLvl[]={20, 40, 100};
+int VecMoveInterceptLvl[]={0,1};
+int VecMoveAcceleratorLvl[]={0,20,15,10,5};
+int VecMovePortalLvl[]={0,1000,2000,3000,4000,5000};
+int VecMoveRadarLvl[]={0,10,20,30,40,50};
+int VecMoveCoverLvl[]={0,20,15,10,5};
+int VecMoveExchangeLvl[]={0,1};
+
+int VecProtectHPLvl[]={0,20000,40000,80000,140000,250000,450000};//{10000,20000,40000,80000,160000,320000,640000};
+int VecProtectArmourLvl[]={0,13,26,38,51};//{0,26,51,77,102};
+int VecProtectShieldLvl[]={0,20000,40000,80000,140000,250000,450000};//{10000,20000,40000,80000,160000,320000,640000};
+int VecProtectShieldIncLvl[]={50,200,300,400,600};
+int VecProtectShieldReduceLvl[]={0,26,51,77,102};//{0,13,26,38,51};//0,13,26,38,51
+int VecProtectInvulnerabilityLvl[]={0,1,2};
+int VecProtectRepairLvl[]={0,200,400,600,800};
+int VecProtectAntiExchangeLvl[]={0,1};
+
+int VecAttackCannonLvl[]={0, 300, 600, 900, 1350, 1800};//{0,200,400,600,900,1200};
+int VecAttackLaserLvl[]={0,250,500,800,1100,1400};
+int VecAttackMissileLvl[]={0,300,700,1100,1500};
+int VecAttackAccuracyLvl[]={0,128,256,512,640};
+int VecAttackMineLvl[]={0,100,500,2000,10000};
+int VecAttackTransiverLvl[]={0,300,500,700,1000};
+
+int VecSystemSensorLvl[]={0,2,4,6,8};
+int VecSystemSensorLvlDestroy[]={0,20,40,80,120};
+int VecSystemSensorLvlDetonation[]={256,179,128,77,26};//{256,218,179,141,102};
+int VecSystemStealthLvl[]={0,1,2};
+int VecSystemRechargeLvl[]={0,40000,80000,160000,320000};
+int VecSystemHackerLvl[]={0,1,2,4,6,8,10};
+int VecSystemJummerLvl[]={0,15,25,35,45};
+int VecSystemDisintegratorLvl[]={0,13,26,38};
+int VecSystemConstructorLvl[]={0,40000,80000,160000,320000};
+
+int VecMoveGravitorLvl[]={0,60,45,30};
+int VecMoveGravitorPeriod[]={0,120,210,300};
+
+int PactPercent[]={0, 13, 26, 38, 51, 64, 77, 77};//{0, 13, 26, 52, 77, 103, 128, 128 };
+
+int CotlBonusCorvetteArmourVal[]={13, 18, 23, 26};//{32, 48, 56, 60, 62, 63};
+int CotlBonusCruiserArmourVal[]={18, 28, 33, 36, 38};//{38, 57, 66, 70, 72, 73};
+int CotlBonusDreadnoughtArmourVal[]={18, 28, 33, 36, 38};//{38, 57, 66, 70, 72, 73};
+int CotlBonusDevastatorArmourVal[]={10, 15, 20, 23};//{19, 28, 32, 34, 35};
+int CotlBonusWarBaseArmourVal[]={13, 18, 23, 26};//{25, 37, 43, 46, 47};
+int CotlBonusWarBaseArmourAllVal[]={13, 21, 26};//{13, 19, 22, 23};
+
+int CotlBonusCorvetteAccuracyVal[]={90, 141, 167, 180, 192};//{192, 295, 333, 359, 384};//{192, 288, 336, 360, 372, 378, 381, 382};
+int CotlBonusCruiserAccuracyVal[]={51, 77, 90, 97, 102};//{90, 141, 167, 180, 192};//{96, 144, 168, 180, 186, 189, 190};
+int CotlBonusDreadnoughtAccuracyVal[]={90, 141, 167, 180, 192};//{192, 295, 333, 359, 384};//{192, 288, 336, 360, 372, 378, 381, 382};
+int CotlBonusDevastatorAccuracyVal[]={51, 77, 90, 97, 102};//{90, 141, 167, 180, 192};//{96, 144, 168, 180, 186, 189, 190};
+int CotlBonusWarBaseAccuracyVal[]={51, 77, 90, 97, 102};//{90, 141, 167, 180, 192};//{96, 144, 168, 180, 186, 189, 190};
+
+int CotlBonusDevastatorBombVal[]={300, 450, 525, 570, 590, 600};
+int CotlBonusShipyardSupplyVal[]={64, 90, 116, 128};//{64, 96, 112, 120, 124, 126, 127};
+int CotlBonusSciBaseSupplyVal[]={64, 90, 116, 128};//{64, 96, 112, 120, 124, 126, 127};
+
+int CotlBonusShipyardRepairAllVal[]={100, 150, 175, 200};
+int CotlBonusMinePowerVal[]={100, 150, 175, 200};
+
+int CotlBonusPlanetEmpireCntVal[]={25, 40, 50};
+int CotlBonusPlanetEnclaveCntVal[]={15, 22, 30};
+int CotlBonusPlanetColonyCntVal[]={10, 15, 20};
+
+int CotlBonusFlagshipPowerVal[]={64, 128, 192, 256};
+
+int BuildingCost[]={
+		0, 0, 0, 0, 0,
+		1000,4000,15000, 65000,250000, // Energy
+		1000,4000,15000, 65000,250000, // Lab
+		1000,4000,15000, 65000,250000, // Missile
+		1000,4000,15000, 65000,250000, // Terraform
+		500, 2000, 8000, 15000, 65000, // Storage
+		500, 2000, 8000, 15000, 65000, // Xenon
+		500, 2000, 8000, 15000, 65000, // Titan
+		500, 2000, 8000, 15000, 65000, // Silicon
+		500, 2000, 8000, 15000, 65000, // Crystal
+		1000,4000,15000, 65000,250000, // Farm
+		1000,4000,15000, 65000,250000, // Electronics
+		1000,4000,15000, 65000,250000, // Metal
+		1000,4000,15000, 65000,250000, // Antimatter
+		1000,4000,15000, 65000,250000, // Plasma
+		1000,4000,15000, 65000,250000, // City
+		2000,8000,30000,120000,480000, // Module
+		4000,16000,60000,240000,960000, // Tech
+		2000,8000,30000,120000,480000, // Fuel
+		2000,8000,30000,120000,480000, // Power
+		2000,8000,30000,120000,480000, // Armour
+		2000,8000,30000,120000,480000, // Droid
+		2000,8000,30000,120000,480000, // Machinery
+		2000,8000,30000,120000,480000, // Engineer
+		2000,8000,30000,120000,480000, // Mine
+		2000,8000,30000,120000,480000, // Technician
+		2000,8000,30000,120000,480000 // Navigator
+};
+
+int BuildingEnergy[]={
+		0, 0, 0, 0, 0,
+		11,21,32,42,53, // Energy
+		-5,-10,-15,-20,-25, // Lab
+		-5,-10,-15,-20,-25, // Missile
+		-5,-10,-15,-20,-25, // Terraform
+		-1,-2,-3, -4, -5, //-1,-2,-4, -8,-16, // Storage
+		-5,-10,-15,-20,-25, // Xenon
+		-5,-10,-15,-20,-25, // Titan
+		-5,-10,-15,-20,-25, // Silicon
+		-5,-10,-15,-20,-25, // Crystal
+		-5,-10,-15,-20,-25, // Farm
+		-5,-10,-15,-20,-25, // Electronics
+		-5,-10,-15,-20,-25, // Metal
+		-5,-10,-15,-20,-25, // Antimatter
+		-5,-10,-15,-20,-25, // Plasma
+		-5,-10,-15,-20,-25, // City
+		-5,-10,-15,-20,-25, // Module
+		-5,-10,-15,-20,-25, // Tech
+		-5,-10,-15,-20,-25, // Fuel
+		-5,-10,-15,-20,-25, // Power
+		-5,-10,-15,-20,-25, // Armour
+		-5,-10,-15,-20,-25, // Droid
+		-5,-10,-15,-20,-25, // Machinery
+		-5,-10,-15,-20,-25, // Engineer
+		-5,-10,-15,-20,-25, // Mine
+		-5,-10,-15,-20,-25, // Technician
+		-5,-10,-15,-20,-25 // Navigator
+
+/*		0, 0, 0, 0, 0,
+		4,8,16,32,64, // Energy
+		-1,-3,-7,-15,-31, // Lab
+		-1,-2,-4, -8,-16, // Missile
+		-1,-2,-4, -8,-16, // Terraform
+		-1,-1,-2, -3, -4, //-1,-2,-4, -8,-16, // Storage
+		-1,-3,-7,-15,-31, // Xenon
+		-1,-3,-7,-15,-31, // Titan
+		-1,-3,-7,-15,-31, // Silicon
+		-1,-3,-7,-15,-31, // Crystal
+		-1,-3,-7,-15,-31, // Farm
+		-1,-3,-7,-15,-31, // Electronics
+		-1,-3,-7,-15,-31, // Metal
+		-1,-3,-7,-15,-31, // Antimatter
+		-1,-3,-7,-15,-31, // Plasma
+		-3,-6,-12,-22,-31, // City
+		-3,-6,-12,-22,-31, // Module
+		-3,-6,-12,-22,-31, // Tech
+		-3,-6,-12,-22,-31, // Fuel
+		-3,-6,-12,-22,-31, // Power
+		-3,-6,-12,-22,-31, // Armour
+		-3,-6,-12,-22,-31, // Droid
+		-3,-6,-12,-22,-31, // Machinery
+		-3,-6,-12,-22,-31, // Engineer
+		-3,-6,-12,-22,-31, // Mine
+		-3,-6,-12,-22,-31, // Technician
+		-3,-6,-12,-22,-31 // Navigator*/
+
+/*		0, 0, 0, 0, 0,
+
+		12,24,48,96,192, // Energy
+
+		-2,-4,-8,-16,-32, // Shield
+		-2,-4,-8,-16,-32, // Missile
+		-2,-4,-8,-16,-32, // Terraform
+		-2,-4,-8,-16,-32, // Storage
+		-2,-4,-8,-16,-32, // Xenon
+		-2,-4,-8,-16,-32, // Titan
+		-2,-4,-8,-16,-32, // Silicon
+		-2,-4,-8,-16,-32, // Crystal
+		-2,-4,-8,-16,-32, // Farm
+		-2,-4,-8,-16,-32, // Electronics
+		-2,-4,-8,-16,-32, // Metal
+		-2,-4,-8,-16,-32, // Antimatter
+		-2, -4, -8, -16, -32, // Plasma
+
+		-3,-6,-12,-24,-48, // City
+		-3,-6,-12,-24,-48, // Module
+		-3,-6,-12,-24,-48, // Tech
+		-3,-6,-12,-24,-48, // Fuel
+		-3,-6,-12,-24,-48, // Power
+		-3,-6,-12,-24,-48, // Armour
+		-3,-6,-12,-24,-48, // Droid
+		-3,-6,-12,-24,-48, // Machinery
+		-3,-6,-12,-24,-48, // Engineer
+		-3,-6,-12,-24,-48, // Mine
+		-3,-6,-12,-24,-48, // Technician
+		-3,-6,-12,-24,-48 // Navigator
+*/
+};
+
+const int CEmpire::BuildingTechLvlCost[CEmpire::BuildingTypeCnt*CEmpire::BuildingLvlCnt] = {
+		0, 0, 0, 0, 0,
+		 750,1500, 6000,25000, 95000, // Energy
+		 500,1000, 3000,15000, 65000, // Lab
+		1000,3000,15000,65000,250000, // Missile
+		1000,3000,15000,65000,250000, // Terraform
+		 500,1000, 3000,15000, 65000, // Storage
+		 500,1000, 3000,15000, 65000, // Xenon
+		 500,1000, 3000,15000, 65000, // Titan
+		 500,1000, 3000,15000, 65000, // Silicon
+		 500,1000, 3000,15000, 65000, // Crystal
+		1000,3000,15000,65000,250000, // Farm
+		1000,3000,15000,65000,250000, // Electronics
+		1000,3000,15000,65000,250000, // Metal
+		1000,3000,15000,65000,250000, // Antimatter
+		1000,3000,15000,65000,250000, // Plasma
+		1000,3000,15000,65000,250000, // City
+		1000,3000,15000,65000,250000, // Module
+		2000,6000,30000,130000,500000, // Tech
+		1000,3000,15000,65000,250000, // Fuel
+		1000,3000,15000,65000,250000, // Power
+		1000,3000,15000,65000,250000, // Armour
+		1000,3000,15000,65000,250000, // Droid
+		1000,3000,15000,65000,250000, // Machinery
+		1000,3000,15000,65000,250000, // Engineer
+		1000,3000,15000,65000,250000, // Mine
+		1000,3000,15000,65000,250000, // Technician
+		1000,3000,15000,65000,250000 // Navigator
+};
+
+struct SBuildingSupply {
+	int m_ItemType;
+	int m_Cnt[1+5];
+};
+
+struct SBuildingForItem {
+	bool m_IsFinalLoop;
+	int m_Manufacture;
+	int m_BuildingType;
+	int m_Range;
+	int m_Cnt[1+5];
+	int m_SupplyCnt;
+	static const int SupplyMax=3;
+	SBuildingSupply m_Supply[SupplyMax];
+};
+
+const int BuildingForItemCnt=2;
+
+// manufacture:
+//
+// hydrogen: 1
+// crystal,titan,silicon,xenon: 40
+//
+// для продовольствия: 40+2*40+2*1=122
+// для металла и плазмы: 60+2*40+2*1=142
+// для антиматерии и электроники: 60+2*40+2*40=220
+//
+// titan,silicon,crystal,xenon: k=40*64/1=2560
+// hydrogen: k=1*64/1=64
+//
+// antimater,electronics: k=((300+40*10+40*10)*64)/5=14080
+// food: k=((200+10*40+10*1)*64)/5=7808
+// metall, plasma: k=((300+10*40+10*1)*64)/5=9088
+//
+// Формулы нужно обновить, результаты верные:
+//
+// money: k=((200+10*122+10*220)*64)/1080=215
+// enginer: k=((200+15*122+5*142)*64)/300=585
+// machinery: k=((200+220*10+5*142)*64)/300=898
+// module: k=((200+200*10+10*142)*64)/40/2,5=2445
+// fuel: k=((200+15*220+5*142)*64)/360=748
+// mine: k=((200+220*10+5*142)*64)/50=5389
+// power: k=((200+15*142+5*142)*64)/390=499
+// armour: k=((200+15*142+5*220)*64)/390=563
+// repair: k=((200+15*220+5*142)*64)/390=691
+// technician: k=((200+5*122+15*142)*64)/30=6272
+// navigator: k=((200+5*122+15*220)*64)/30=8768
+// quarkcore: k=((200+15*220+5*220)*64)/21=14019
+//
+// module_lab: ((200+20*1)*64)/25/2,5=225
+// fuel_lab: ((200+16*40)*64)/32=1680
+//
+// add=(k*lvl*cnt)>>6
+// k - стабильный коэфициент каждого итема
+// lvl - сложность
+// cnt - кол-во сделаный итемов
+//
+// пример:
+// k=((10+5*8+15*8)*64)/24=453
+// add=(453*400000*1)>>6=2831250
+//
+// k=((10+10*10+10*8)*64)/40=304
+// add=(304*1*1)>>6=4
+
+
+SBuildingForItem BuildingForItem[CEmpire::ItemTypeCnt*BuildingForItemCnt]= {
+	{false,0}, // ItemTypeNone
+	{true ,2445	,CEmpire::BuildingTypeModule,-1,		0, 8, 16, 24, 32, 40,			2, 		CEmpire::ItemTypeElectronics,0,2,4,6,8,10, 	CEmpire::ItemTypeMetal,0,2,4,6,8,10 }, // ItemTypeModule
+	{true ,563	,CEmpire::BuildingTypeArmour,-1,		0, 65, 136, 214, 300, 390,		2, 		CEmpire::ItemTypeMetal,0,3,6,9,12,15, 		CEmpire::ItemTypeElectronics,0,1,2,3,4,5 }, // ItemTypeArmour
+	{true ,499	,CEmpire::BuildingTypePower,-1,			0, 65, 136, 214, 300, 390,		2, 		CEmpire::ItemTypePlasma,0,3,6,9,12,15, 		CEmpire::ItemTypeMetal,0,1,2,3,4,5 }, // ItemTypePower
+	{true ,691	,CEmpire::BuildingTypeDroid,-1,			0, 65, 136, 214, 300, 390,		2, 		CEmpire::ItemTypeElectronics,0,3,6,9,12,15, CEmpire::ItemTypeMetal,0,1,2,3,4,5 }, // ItemTypeRepair
+	{false,0	,0}, // ItemTypeJump
+	{false,0	,0}, // ItemTypeBuild
+	{true ,748	,CEmpire::BuildingTypeFuel,-1,			0, 50, 110, 180, 260, 350,		2, 		CEmpire::ItemTypeAntimatter,0,3,6,9,12,15, 	CEmpire::ItemTypeMetal,0,1,2,3,4,5 }, // ItemTypeFuel
+	{false,0	,0}, // ItemTypeDouble
+	{false,0	,0}, // ItemTypeMonuk
+	{false,14080	,CEmpire::BuildingTypeAntimatter,-1,0, 1, 2, 3, 4, 5,				2, 		CEmpire::ItemTypeCrystal,0,2,4,6,8,10, 		CEmpire::ItemTypeXenon,0,2,4,6,8,10 }, // ItemTypeAntimatter
+	{false,0	,0}, // rez
+	{false,9088	,CEmpire::BuildingTypeMetal,-1,			0, 1, 2, 3, 4, 5,				2, 		CEmpire::ItemTypeTitan,0,2,4,6,8,10, 		CEmpire::ItemTypeHydrogen,0,2,4,6,8,10 }, // ItemTypeMetal
+	{false,14080,CEmpire::BuildingTypeElectronics,-1,	0, 1, 2, 3, 4, 5,				2, 		CEmpire::ItemTypeSilicon,0,2,4,6,8,10, 		CEmpire::ItemTypeXenon,0,2,4,6,8,10 }, // ItemTypeElectronics
+	{false,0	,0}, // ItemTypeProtoplasm
+	{false,0	,0}, // ItemTypeNodes
+	{true ,563	,CEmpire::BuildingTypeArmour,-1,		0, 65, 136, 214, 300, 390,		3, 		CEmpire::ItemTypeMetal,0,3,6,9,12,15, 		CEmpire::ItemTypeElectronics,0,1,2,3,4,5,	CEmpire::ItemTypeProtoplasm,0,1,2,3,4,5 }, // ItemTypeArmour2
+	{true ,499	,CEmpire::BuildingTypePower,-1,			0, 65, 136, 214, 300, 390,		3, 		CEmpire::ItemTypePlasma,0,3,6,9,12,15, 		CEmpire::ItemTypeMetal,0,1,2,3,4,5,			CEmpire::ItemTypeProtoplasm,0,1,2,3,4,5 }, // ItemTypePower2
+	{true ,691	,CEmpire::BuildingTypeDroid,-1,			0, 65, 136, 214, 300, 390,		3, 		CEmpire::ItemTypeElectronics,0,3,6,9,12,15,	CEmpire::ItemTypeMetal,0,1,2,3,4,5,			CEmpire::ItemTypeProtoplasm,0,1,2,3,4,5 }, // ItemTypeRepair2
+	{true ,5389	,CEmpire::BuildingTypeMine,-1,			0, 10,  20,  30,  40,  50,		2, 		CEmpire::ItemTypeAntimatter,0,3,6,9,12,15,	CEmpire::ItemTypePlasma,0,1,2,3,4,5 }, // ItemTypeMine
+	{false,0	,0}, // ItemTypeEGM
+	{true ,215	,CEmpire::BuildingTypeCity,-1,			0, 190, 384, 582, 816, 1080,	2, 		CEmpire::ItemTypeFood,0,2,4,6,8,10, 		CEmpire::ItemTypeElectronics,0,2,4,6,8,10 }, // ItemTypeMoney
+	{false,2560	,CEmpire::BuildingTypeTitan, -1,		0, 1, 2, 3, 4, 5,				0}, // ItemTypeTitan
+	{false,2560	,CEmpire::BuildingTypeSilicon, -1,		0, 1, 2, 3, 4, 5,				0}, // ItemTypeSilicon
+	{false,2560	,CEmpire::BuildingTypeCrystal, -1,		0, 1, 2, 3, 4, 5,				0}, // ItemTypeCrystal
+	{false,2560	,CEmpire::BuildingTypeXenon, -1,		0, 1, 2, 3, 4, 5,				0}, // ItemTypeXenon
+	{false,64	,0}, // ItemTypeHydrogen
+	{false,7808	,CEmpire::BuildingTypeFarm, -1,			0, 1, 2, 3, 4, 5,				2, 		CEmpire::ItemTypeHydrogen,0,2,4,6,8,10, 	CEmpire::ItemTypeXenon,0,2,4,6,8,10}, // ItemTypeFood
+	{false,9088	,CEmpire::BuildingTypePlasma,-1,		0, 1, 2, 3, 4, 5,				2, 		CEmpire::ItemTypeXenon,0,2,4,6,8,10, 		CEmpire::ItemTypeHydrogen,0,2,4,6,8,10 }, // ItemTypePlasma
+	{true ,898	,CEmpire::BuildingTypeMachinery,-1,		0, 50, 105, 165, 230, 300,		2, 		CEmpire::ItemTypeElectronics,0,3,6,9,12,15,	CEmpire::ItemTypePlasma,0,1,2,3,4,5 }, //  ItemTypeMachinery
+	{true ,585	,CEmpire::BuildingTypeEngineer,-1,		0, 50, 105, 165, 230, 300,		2, 		CEmpire::ItemTypeFood,0,3,6,9,12,15,		CEmpire::ItemTypePlasma,0,1,2,3,4,5 }, // ItemTypeEngineer
+	{true ,6272	,CEmpire::BuildingTypeTechnician,-1,	0, 5, 11, 17, 23, 30,			2, 		CEmpire::ItemTypeMetal,0,3,6,9,12,15,		CEmpire::ItemTypeFood,0,1,2,3,4,5 }, // ItemTypeTechnician
+	{true ,8768	,CEmpire::BuildingTypeNavigator,-1,		0, 5, 11, 17, 23, 30,			2, 		CEmpire::ItemTypeElectronics,0,3,6,9,12,15,	CEmpire::ItemTypeFood,0,1,2,3,4,5 }, // ItemTypeNavigator
+    {true ,14019,CEmpire::BuildingTypeTech,-1,          0, 3, 7, 11, 16, 21,        	2,      CEmpire::ItemTypeAntimatter,0,3,6,9,12,15,  CEmpire::ItemTypeElectronics,0,1,2,3,4,5 }, // ItemTypeQuarkCore
+    {false,0    ,0}, // ItemTypeNodeA
+    {false,0    ,0}, // ItemTypeNodeB
+    {false,0    ,0}, // ItemTypeNodeC
+
+
+// Second
+	{false,0	,0}, // ItemTypeNone
+	{true ,225	,CEmpire::BuildingTypeLab,10,			0, 5, 10, 15, 20, 25,			1, 		CEmpire::ItemTypeHydrogen,0,4,8,12,16,20 }, // ItemTypeModule
+	{false,0	,0}, // ItemTypeArmour
+	{false,0	,0}, // ItemTypePower
+	{false,0	,0}, // ItemTypeRepair
+	{false,0	,0}, // ItemTypeJump
+	{false,0	,0}, // ItemTypeBuild
+	{true ,1680	,CEmpire::BuildingTypeLab,-1,			0, 6, 10, 16, 24, 32,			1,      CEmpire::ItemTypeCrystal,0,3,5,8,12,16 }, // ItemTypeFuel
+	{false,0	,0}, // ItemTypeDouble
+	{false,0	,0}, // ItemTypeMonuk
+	{false,0	,0}, // ItemTypeAntimatter
+	{false,0	,0}, // rez
+	{false,0	,0}, // ItemTypeMetal
+	{false,0	,0}, // ItemTypeElectronics
+	{false,0	,0}, // ItemTypeProtoplasm
+	{false,0	,0}, // ItemTypeNodes
+	{false,0	,0}, // ItemTypeArmour2
+	{false,0	,0}, // ItemTypePower2
+	{false,0	,0}, // ItemTypeRepair2
+	{false,0	,0}, // ItemTypeMine
+	{false,0	,0}, // ItemTypeEGM
+	{false,0	,0}, // ItemTypeMoney
+	{false,0	,0}, // ItemTypeTitan
+	{false,0	,0}, // ItemTypeSilicon
+	{false,0	,0}, // ItemTypeCrystal
+	{false,0	,0}, // ItemTypeXenon
+	{false,0	,0}, // ItemTypeHydrogen
+	{false,0	,0}, // ItemTypeFood
+	{false,0	,0}, // ItemTypePlasma
+	{false,0	,0}, //  ItemTypeMachinery
+	{false,0	,0}, // ItemTypeEngineer
+	{false,0	,0}, // ItemTypeTechnician
+	{false,0	,0}, // ItemTypeNavigator
+	{false,0	,0},  // ItemTypeQuarkCore
+    {false,0    ,0}, // ItemTypeNodeA
+    {false,0    ,0}, // ItemTypeNodeB
+    {false,0    ,0} // ItemTypeNodeC
+};
+
+struct SBuildingInfo {
+	bool m_Supply;
+};
+
+SBuildingInfo BuildingInfo[CEmpire::BuildingTypeCnt]={
+	false,
+	false,		// BuildingTypeEnergy
+	true,		// BuildingTypeLab
+	false,		// BuildingTypeMissile
+	false,		// BuildingTypeTerraform
+	false,		// BuildingTypeStorage
+	true,		// BuildingTypeXenon
+	true,		// BuildingTypeTitan
+	true,		// BuildingTypeSilicon
+	true,		// BuildingTypeCrystal
+	true,		// BuildingTypeFarm
+	true,		// BuildingTypeElectronics
+	true,		// BuildingTypeMetal
+	true,		// BuildingTypeAntimatter
+	true,		// BuildingTypePlasma
+	true,		// BuildingTypeCity
+	true,		// BuildingTypeModule
+	true,		// BuildingTypeTech
+	true,		// BuildingTypeFuel
+	true,		// BuildingTypePower
+	true,		// BuildingTypeArmour
+	true,		// BuildingTypeDroid
+	true,		// BuildingTypeMachinery
+	true,		// BuildingTypeEngineer
+	true,		// BuildingTypeMine
+	true,		// BuildingTypeTechnician
+	true,		// BuildingTypeNavigator
+};
+
+static __inline__ qword rdtsc(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, 0);
+	return qword(tv.tv_sec)*1000000+tv.tv_usec;
+
+//	dword hi, lo;
+//	__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+//	return ( (qword)lo)|( ((qword)hi)<<32 );
+}
+//typedef struct { unsigned long t[2]; } timing;
+//#define timing_now(x) asm volatile(".byte 15;.byte 49" : "=a"((x)->t[0]),"=d"((x)->t[1]))
+//#define timing_diff(x,y) (((x)->t[0] - (double) (y)->t[0]) + 4294967296.0 * ((x)->t[1] - (double) (y)->t[1]))
+
+void CEmpire::Constructor(CHeap * heap)
+{
+	int i,u;
+
+	CVirtual::Constructor(heap);
+	m_Heap=heap;
+
+	m_CntClear=0;
+
+	m_QuitState=0;
+	m_FastUnload=false;
+
+	m_Calc=NULL;
+	m_CalcNum=0;
+
+	m_HyperPortalLastTime=0;
+
+	m_ServerId=0;
+	m_ServerNum=0;
+	m_Cotl=false;
+	m_CotlId=0;
+	m_CotlType=SEmpireCotl::TypeNone;
+	m_CotlSize=0;
+	m_CotlLvl=0;
+	m_CotlZoneLvl=0;
+	m_CotlMode=0;
+	m_CotlAction=0;
+	m_ServerName[0]=0;
+	m_Ready=false;
+	m_ReadyGTime=0;
+	m_ExitTestGTime=0;
+
+	m_CotlOwnerId=0;
+	m_CotlUnionId=0;
+	m_CotlFleetId=0;
+	m_CotlParentId=0;
+	m_CotlLocId=0;
+	m_CotlDelete=false;
+
+	m_SectorMinX=0;
+	m_SectorMinY=0;
+	m_SectorCntX=0;
+	m_SectorCntY=0;
+	m_NewShipId=2;
+	m_NewShipIdUser=3;
+	m_ScorePeriod=0;
+	m_GameState=0;
+	m_PortalShipNoAccess=false;
+	m_GameTime=0;
+	m_WorldVer=0;
+	m_StateVer=0;
+	m_HelpAtkId=0;
+	m_ActiveAtkId=0;
+
+	m_Sector=NULL;
+	m_Planet=NULL;
+	m_PlanetCnt=NULL;
+	m_PlanetGrow=false;
+
+//	m_SectorSaveDataEmpty=NULL;
+//	m_SectorSaveDataAll=NULL;
+
+
+//	m_Mutex.Constructor(heap);
+////	m_Mutex.InitFast();
+//	m_Mutex.Init();
+
+	m_ActionFirst=NULL;
+	m_ActionLast=NULL;
+
+	m_ActionEmptyFirst=NULL;
+	m_ActionEmptyLast=NULL;
+
+	m_MapImage=NULL;
+    m_MapVersion=1;
+    m_MapImageSize=0;
+	m_MapTime=0;
+
+	m_MMPlanetPos=NULL;
+	m_MMPlanetPosLen=0;
+
+	m_MMPlanetOwner=NULL;
+	m_MMPlanetOwnerLen=0;
+
+//	m_CalcPlanet=NULL;
+	m_CalcTime=0;
+
+//    m_OnlineUserTime=0;
+	m_UpdateStatTime=0;
+	m_AutoSaveGTime=0;
+	m_ScoreSaveTime=0;
+	m_HLTime=0;
+	m_AutoImportExportTime=0;
+	m_KlingBirthTime=0;
+	m_SupplyTime=0;
+	m_TicketTime=0;
+	m_ShieldGlobalTime=0;
+	m_AICalcTime=0;
+	m_CotlSynTime=0;
+	m_CotlSynTimeSend=0;
+
+//	m_State="";
+//	m_TimeLastLoop=0;
+//	m_TimeLastLoopRDTSC=0;
+//	m_TimeLastLoopMutexRDTSC=0;
+//	m_TimeLastLoopMutexCalcRDTSC=0;
+//	m_LoopCnt=0;
+
+	m_EnterFrom[0]=NULL;
+	m_EnterFrom[1]=NULL;
+
+	m_StatEmpireCnt=0;
+	m_StatPlanetCnt=0;
+	m_StatNeutralCnt=0;
+	m_StatOwnerCotlPlanetCnt=0;
+
+	m_OnlineUserVer=1;
+	m_OnlineUserBuf=NULL;
+	m_OnlineUserBuf2=NULL;
+	m_OnlineUserLen=0;
+	m_OnlineUserBufMax=0;
+
+	MemZero(m_AIUserList,sizeof(SUser)*AIUserCnt);
+	for(i=0;i<AIUserCnt;i++) {
+		m_AIUserList[i].m_AccountId=OwnerAI|i;
+		for(u=0;u<CptMax;u++) {
+			m_AIUserList[i].m_Cpt[u].m_Id=0xffffff00|(i<<4)|u;
+		}
+		m_AIUserList[i].m_PowerMul=256;
+		m_AIUserList[i].m_ManufMul=1;
+		m_AIUserList[i].m_LootMul=256;
+		m_AIUserList[i].m_LootForPlayerMul=256;
+		m_AIUserList[i].Change();
+	}
+
+	m_PathMoveFirst=NULL;
+	m_PathMoveLast=NULL;
+	m_PathMoveEmptyFirst=NULL;
+	m_PathMoveEmptyLast=NULL;
+	m_PathMoveGroupNew=1;
+
+	m_StatFirst=NULL;
+	m_StatLast=NULL;
+	m_StatMap.Constructor(heap);
+
+	m_EmpireColony=false;
+
+	m_OpsAnm=1;
+	m_OpsFlag=0;
+	m_OpsModuleMul=1;
+	m_OpsModuleAdd=10;
+	m_OpsCostBuildLvl=256;
+	m_OpsSpeedCapture=1;
+	m_OpsSpeedBuild=256;
+	m_OpsRestartCooldown=0;
+	m_OpsStartTime=0;
+	m_OpsPulsarActive=0;
+	m_OpsPulsarPassive=0;
+	m_OpsWinScore=0;
+	m_OpsRewardExp=0;
+	m_OpsMaxRating=0;
+	m_OpsPriceEnter=0;
+	m_OpsPriceEnterType=0;
+	m_OpsPriceCapture=0;
+	m_OpsPriceCaptureType=0;
+	m_OpsPriceCaptureEgm=0;
+	m_OpsProtectCooldown=0;
+	m_OpsTeamOwner=-1;
+	m_OpsTeamEnemy=-1;
+	m_OpsJumpRadius=DefaultJumpRadius;
+	JumpRadius2=m_OpsJumpRadius*m_OpsJumpRadius;
+	for(i=0;i<TalentCnt;i++) { m_OpsPlayerFlagshipTalentOff[i]=0; m_OpsPlayerFlagshipTalentOn[i]=0; }
+
+	m_ProtectKillMass=0;
+	m_ProtectTime=0;
+	m_PlanetDestroy=0;
+
+	m_InnerBuf.Constructor(m_Heap);
+	m_InnerBuf.SetAlignShift(10);
+
+	m_LandingPlaceCnt=0;
+	m_LandingAccess=NULL;
+
+	m_Rating=0;
+	m_RatingWrite=0;
+
+	m_ServerGetCotl_CotlId=-1;
+	m_ServerGetCotl_Mode=-1;
+
+	m_AIDestroyCnt=0;
+
+	MemZero(m_FonCfg,FonCfgLen);
+
+	m_IB_Flag=0;
+	m_IB1_Type=0;
+	m_IB1_Date=0;
+	m_IB2_Type=0;
+	m_IB2_Date=0;
+
+	m_CombatFlag=0;
+
+	m_ToLogSectorX=0;
+	m_ToLogSectorY=0;
+	m_ToLogPlanetNum=-1;
+
+	m_NewsAddFlag=0;
+
+	m_SessionChangeStateTime=0;
+
+	m_LogBattle=false;
+
+	m_CurSrc=NULL;
+	m_CurSrcLen=0;
+	m_CurCode=NULL;
+	m_CurCodeLen=0;
+	m_NewCodeExist=false;
+	m_CurCodeState=0;
+	m_CurCodeStaticLoad=false;
+	m_NewSrc=NULL;
+	m_NewSrcLen=0;
+	m_NewCode=NULL;
+	m_NewCodeLen=0;
+
+	m_QuestDestroyUnit=false;
+
+	m_Code.Constructor(heap);
+	m_CodeTime=0;
+	m_CodeFunRunFirst=NULL;
+	m_CodeFunRunLast=NULL;
+	MemZero(m_StaticVar,sizeof(CEmpireCode::SVar)*StaticVarMax);
+	m_StaticVarBuf.Constructor(heap);
+	m_StaticVarBuf.SetAlignShift(8);
+
+	m_Def.Constructor(heap);
+	m_Def.SetAlignShift(8);
+
+	m_Log.Constructor(heap);
+	m_Log.SetAlignShift(9);
+	m_LogBase=10;
+
+	MemZero(&m_Spawn,sizeof(SSpawn));
+	m_SpawnCnt=0;
+
+	MemZero(m_Gang,GangMax*sizeof(SGang));
+	m_GangActivator=0;
+
+	m_AutoImportExportTakt=0;
+}
+
+
+CEmpire::~CEmpire()
+{
+
+	Clear();
+}
+
+
+void CEmpire::Clear()
+{
+	int i,u,x,y;
+
+	m_CntClear++;
+
+	m_Ready=false;
+	m_ReadyGTime=0;
+	m_ExitTestGTime=0;
+
+	m_HyperPortalLastTime=0;
+
+	GangClearAll();
+
+	if(m_Sector) {
+		SSector * sec=m_Sector;
+		for(y=0;y<m_SectorCntY;y++) {
+			for(x=0;x<m_SectorCntX;x++,sec++) {
+
+				SPlanet * planet=sec->m_Planet;
+				for(i=0;i<sec->m_PlanetCnt/*PlanetOnSectorMax*/;i++,planet++) {
+					m_Calc->PlanetVarDel(planet);
+					m_Calc->PlanetBtlDel(planet);
+
+					SShip * ship=planet->m_Ship;
+					for(u=0;u<ShipOnPlanetMax;u++,ship++) {
+						if(ship->m_PathMove) { PathMoveFree(ship->m_PathMove); ship->m_PathMove=NULL; }
+					}
+				}
+			}
+		}
+
+		HFree(m_Sector,m_Heap);
+		m_Sector=NULL;
+	}
+	if(m_Planet) {
+		HFree(m_Planet,m_Heap);
+		m_Planet=NULL;
+	}
+	m_PlanetCnt=0;
+	m_PlanetGrow=false;
+//	if(m_SectorSaveDataAll) {
+//		HFree(m_SectorSaveDataAll,m_Heap);
+//		m_SectorSaveDataAll=NULL;
+//	}
+//	m_SectorSaveDataEmpty=NULL;
+	m_SectorMinX=0;
+	m_SectorMinY=0;
+	m_SectorCntX=0;
+	m_SectorCntY=0;
+	m_NewShipId=2;
+	m_NewShipIdUser=3;
+    m_ScorePeriod=0;
+	m_GameState=0;
+	m_PortalShipNoAccess=false;
+	m_GameTime=0;
+	m_WorldVer=0;
+	m_StateVer=0;
+	m_HelpAtkId=0;
+	m_ActiveAtkId=0;
+
+	m_Occupancy=0;
+
+	m_OpsAnm=1;
+	m_OpsFlag=0;
+	m_OpsModuleMul=1;
+	m_OpsModuleAdd=10;
+	m_OpsCostBuildLvl=256;
+	m_OpsSpeedCapture=1;
+	m_OpsSpeedBuild=256;
+	m_OpsRestartCooldown=0;
+	m_OpsStartTime=0;
+	m_OpsPulsarActive=0;
+	m_OpsPulsarPassive=0;
+	m_OpsWinScore=0;
+	m_OpsRewardExp=0;
+	m_OpsMaxRating=0;
+	m_OpsPriceEnter=0;
+	m_OpsPriceEnterType=0;
+	m_OpsPriceCapture=0;
+	m_OpsPriceCaptureType=0;
+	m_OpsPriceCaptureEgm=0;
+	m_OpsProtectCooldown=0;
+	m_OpsTeamOwner=-1;
+	m_OpsTeamEnemy=-1;
+	m_OpsJumpRadius=DefaultJumpRadius;
+	JumpRadius2=m_OpsJumpRadius*m_OpsJumpRadius;
+	for(i=0;i<TalentCnt;i++) { m_OpsPlayerFlagshipTalentOff[i]=0; m_OpsPlayerFlagshipTalentOn[i]=0; }
+
+	m_ProtectKillMass=0;
+	m_ProtectTime=0;
+	m_PlanetDestroy=0;
+
+	SAction * an=m_ActionFirst;
+	while(an) {
+		SAction * a=an;
+		an=an->m_ActionNext;
+		if(a->m_PathMove) {
+			PathMoveFree(a->m_PathMove);
+			a->m_PathMove=NULL;
+		}
+		HFree(a,m_Heap);
+	}
+	m_ActionFirst=NULL;
+	m_ActionLast=NULL;
+
+	an=m_ActionEmptyFirst;
+	while(an) {
+		SAction * a=an;
+		an=an->m_ActionNext;
+		if(a->m_PathMove) ERROR_E;
+		HFree(a,m_Heap);
+	}
+	m_ActionEmptyFirst=NULL;
+	m_ActionEmptyLast=NULL;
+
+	m_PathMoveGroupNew=1;
+	PathMoveClear();
+
+    if(m_MapImage) {
+        gdFree(m_MapImage);
+		m_MapImage=NULL;
+    }
+    m_MapVersion=1;
+    m_MapImageSize=0;
+	m_MapTime=0;
+
+	if(m_MMPlanetPos) {
+		HFree(m_MMPlanetPos,m_Heap);
+		m_MMPlanetPos=NULL;
+	}
+	m_MMPlanetPosLen=0;
+
+	if(m_MMPlanetOwner) {
+		HFree(m_MMPlanetOwner,m_Heap);
+		m_MMPlanetOwner=NULL;
+	}
+	m_MMPlanetOwnerLen=0;
+
+	if(m_OnlineUserBuf) {
+		HFree(m_OnlineUserBuf,m_Heap);
+		m_OnlineUserBuf=NULL;
+	}
+	if(m_OnlineUserBuf2) {
+		HFree(m_OnlineUserBuf2,m_Heap);
+		m_OnlineUserBuf2=NULL;
+	}
+	m_OnlineUserVer=1;
+	m_OnlineUserLen=0;
+	m_OnlineUserBufMax=0;
+
+	MemZero(m_AIUserList,sizeof(SUser)*AIUserCnt);
+	for(i=0;i<AIUserCnt;i++) {
+		m_AIUserList[i].m_AccountId=OwnerAI|i;
+		for(u=0;u<CptMax;u++) {
+			m_AIUserList[i].m_Cpt[u].m_Id=0xffffff00|(i<<4)|u;
+		}
+		m_AIUserList[i].m_PowerMul=256;
+		m_AIUserList[i].m_ManufMul=1;
+		m_AIUserList[i].m_LootMul=256;
+		m_AIUserList[i].m_LootForPlayerMul=256;
+		m_AIUserList[i].Change();
+	}
+
+	m_Rating=0;
+	m_RatingWrite=0;
+
+	m_LandingPlaceCnt=0;
+	if(m_LandingAccess) { HFree(m_LandingAccess,m_Heap); m_LandingAccess=NULL; }
+
+	for(i=0;i<ConsumptionMax;i++) {
+		m_Consumption[i].m_ItemType=0;
+		m_Consumption[i].m_Cnt=0;
+	}
+
+	MemZero(m_TeamRel,(1<<TeamMaxShift)*(1<<TeamMaxShift));
+	m_TeamRelVer=0;
+	MemZero(m_TeamScore,sizeof(int)*(1<<TeamMaxShift));
+
+	StatClear();
+
+	MemZero(m_FonCfg,FonCfgLen);
+
+    m_IB_Flag=0;
+    m_IB1_Type=0;
+    m_IB1_Date=0;
+    m_IB2_Type=0;
+    m_IB2_Date=0;
+
+	m_CombatFlag=0;
+
+	m_ToLogSectorX=0;
+	m_ToLogSectorY=0;
+	m_ToLogPlanetNum=-1;
+
+	m_NewsAddFlag=0;
+
+	m_SessionChangeStateTime=0;
+
+	m_QuestDestroyUnit=false;
+
+	if(m_CurSrc) { HFree(m_CurSrc,m_Heap); m_CurSrc=NULL; }
+	m_CurSrcLen=0;
+	if(m_CurCode) { HFree(m_CurCode,m_Heap); m_CurCode=NULL; }
+	m_CurCodeLen=0;
+	m_NewCodeExist=false;
+	m_CurCodeState=0;
+	m_CurCodeStaticLoad=false;
+	if(m_NewSrc) { HFree(m_NewSrc,m_Heap); m_NewSrc=NULL; }
+	m_NewSrcLen=0;
+	if(m_NewCode) { HFree(m_NewCode,m_Heap); m_NewCode=NULL; }
+	m_NewCodeLen=0;
+
+	m_LogBattle=false;
+
+	MemZero(m_StaticVar,sizeof(CEmpireCode::SVar)*StaticVarMax);
+	m_StaticVarBuf.Clear();
+	CodeClear();
+	m_Def.Clear();
+
+	MemZero(m_Gang,GangMax*sizeof(SGang));
+	m_GangActivator=0;
+
+	m_AutoImportExportTakt=0;
+}
+
+bool CEmpire::IsEdit()
+{
+	return (m_CotlMode & SEmpireServerSlot::ModeEdit)!=0;
+}
+
+void CEmpire::CotlClear()
+{
+	Clear();
+	m_CotlOwnerId=0;
+	m_CotlUnionId=0;
+	m_CotlFleetId=0;
+	m_CotlParentId=0;
+	m_CotlLocId=0;
+	m_CotlDelete=false;
+	m_CotlType=SEmpireCotl::TypeUnknown;
+	m_CotlSize=0;
+	m_CotlLvl=0;
+	m_CotlZoneLvl=0;
+	m_CotlMode=0;
+	m_CotlAction=0;
+
+	m_ServerGetCotl_CotlId=-1;
+    m_ServerGetCotl_Mode=0;
+}
+
+void CEmpire::Init(dword serverid,int wishsizex,int wishsizey)
+{
+ERROR_E;
+	CStr tstr(m_Heap);
+
+	m_EmpireColony=true;
+
+	SEmpireServer es;
+	if(g_ACM->EmpireServerList(serverid,0,&es,1)!=1) ERROR_E;
+	m_ServerId=serverid;
+	m_ServerType=es.m_Type;
+	int len=StrLen(es.m_Name); if(len>=SEmpireServer::NameLen) len=SEmpireServer::NameLen-1;
+	if(len<=0) ERROR_E;
+	MemCopy(m_ServerName,es.m_Name,len);
+	m_ServerName[len]=0;
+
+	m_EnterOnlyPlusar=es.m_EnterOnlyPlusar;
+	m_StartModule=es.m_StartModule;
+	m_StartRes=es.m_StartRes;
+	m_BuildSpeed=es.m_BuildSpeed;
+	m_ModuleMul=es.m_ModuleMul;
+	m_ResMul=es.m_ResMul;
+	m_ResIncPeriod=es.m_ResIncPeriod;
+	m_SupplyMul=es.m_SupplyMul;
+	m_TechSpeed=es.m_TechSpeed;
+	m_CaptureSpeed=es.m_CaptureSpeed;
+	m_InfrCostMul=es.m_InfrCostMul;
+	m_EmpireLifeTime=es.m_EmpireLifeTime;
+	m_SessionPeriod=es.m_SessionPeriod;
+	m_SessionStart=es.m_SessionStart;
+	m_Access=es.m_Access;
+
+	ALogFormat("EmpireSet EmpireLifeTime=<i>",m_EmpireLifeTime);
+
+//	ALogFormat("CLOCKS_PER_SEC=<u>",CLOCKS_PER_SEC);
+
+	m_Rnd.Set(dword(my_time_hq())); m_Rnd.RndEx();
+//	m_Rnd.Set(123); m_Rnd.RndEx();
+
+ALogFormat("EmpireInit00");
+	tstr.Format("<s>empire.sav",DPath);
+    if(access(tstr.GetConst(),F_OK)==0) {
+//		Load(tstr.GetConst(),tstr.Len());
+ALogFormat("EmpireInit01");
+
+//tstr.Format("<s>empire.protoplasm",DPath);
+//SaveSpecial(tstr.GetConst(),tstr.Len());
+//LoadSpecial(tstr.GetConst(),tstr.Len());
+
+		if(m_SectorCntX!=wishsizex || m_SectorCntY!=wishsizey) GrowMap(wishsizex,wishsizey);
+
+ALogFormat("EmpireInit02");
+//		ReCalcUserPlanetCnt();
+
+ALogFormat("EmpireInit03");
+		CalcUserStat();
+
+ALogFormat("EmpireInit04");
+		if(!m_SessionPeriod) BuildScore();
+ALogFormat("EmpireInit05");
+
+//ClearOwner(2);
+//ClearOwner(4);
+//ClearOwner(5);
+
+	} else {
+		CreateMap(wishsizex,wishsizey);
+	}
+
+	Ready();
+
+	ALogFormat("EmpireServerStart <i> <s>",m_ServerId,m_ServerName);
+
+//	Run();
+
+//	m_Ready=true;
+}
+
+void CEmpire::InitCotl(dword serverid,int servernum,int cotlid)
+{
+	m_EmpireColony=false;
+
+	m_Cotl=true;
+	m_CotlType=SEmpireCotl::TypeUnknown;
+	m_ServerNum=servernum;
+
+	CStr tstr(m_Heap);
+
+	SEmpireServer es;
+	if(g_ACM->EmpireServerList(serverid,0,&es,1)!=1) ERROR_E;
+	m_ServerId=serverid;
+	m_ServerType=es.m_Type;
+	int len=StrLen(es.m_Name); if(len>=SEmpireServer::NameLen) len=SEmpireServer::NameLen-1;
+	if(len<=0) ERROR_E;
+	MemCopy(m_ServerName,es.m_Name,len);
+	m_ServerName[len]=0;
+
+	m_EnterOnlyPlusar=es.m_EnterOnlyPlusar;
+	m_StartModule=es.m_StartModule;
+	m_StartRes=es.m_StartRes;
+	m_BuildSpeed=es.m_BuildSpeed;
+	m_ModuleMul=es.m_ModuleMul;
+	m_ResMul=es.m_ResMul;
+	m_ResIncPeriod=es.m_ResIncPeriod;
+	m_SupplyMul=es.m_SupplyMul;
+	m_TechSpeed=es.m_TechSpeed;
+	m_CaptureSpeed=es.m_CaptureSpeed;
+	m_InfrCostMul=es.m_InfrCostMul;
+	m_EmpireLifeTime=es.m_EmpireLifeTime;
+	m_SessionPeriod=es.m_SessionPeriod;
+	m_SessionStart=es.m_SessionStart;
+	m_Access=es.m_Access;
+
+	m_Rnd.Set(clock() ^ my_time()); m_Rnd.RndEx();
+
+	g_EMM->ServerUpdate(m_ServerNum,m_CalcNum,m_CotlId);
+
+	m_CotlId=cotlid;
+	if(m_CotlId) {
+		SEmpireCotl cotlinfo;
+		if(!g_EMM->CotlGet(m_CotlId,&cotlinfo)) ERROR_E;
+		m_CotlOwnerId=cotlinfo.m_AccountId;
+		m_CotlUnionId=cotlinfo.m_UnionId;
+		m_CotlParentId=cotlinfo.m_ParentId;
+		m_CotlLocId=cotlinfo.m_ParentId;
+		m_CotlDelete=false;
+		m_CotlType=cotlinfo.m_Type;
+		m_CotlSize=cotlinfo.m_Size;
+		m_CotlLvl=cotlinfo.m_Lvl;
+		m_CotlZoneLvl=g_EMM->EmpireCotlZoneLvl(m_CotlId);
+		m_CotlMode=0;
+		m_CotlAction=0;
+//		if(g_EMM->ServerGetCotl(m_ServerNum,(int *)&m_CotlMode)!=m_CotlId) ERROR_E;
+
+		if(m_CotlType==SEmpireCotl::TypeUser) {
+			m_CotlFleetId=g_EMM->EmpireFleetGetIdByCotl(m_CotlId);
+		}
+
+		CStr data(m_Heap);
+		g_EMM->CotlWorldLoad(m_CotlId,false,data);
+		data.SetPointer(0);
+		if(CotlLoad(data,false));
+		else {
+			CotlNew(0);
+			Save();
+		}
+		if(cotlinfo.m_Flag & SEmpireCotlSyn::fDevelopment) m_GameState|=GameStateDevelopment; else m_GameState&=~GameStateDevelopment;
+		LoadHyperportal();
+		LoadHyperportalShip();
+		g_EMM->ServerUpdate(m_ServerNum,m_CalcNum,m_CotlId);
+		Ready();
+	}
+
+	ALogFormat("EmpireServerStart <i> <s> <i> CotlId=<i> CotlType=<i>",m_ServerId,m_ServerName,m_ServerNum,m_CotlId,m_CotlType);
+
+//	Run();
+}
+
+void CEmpire::InitOpsForUserCotl()
+{
+	int i;
+
+	m_OpsFlag=
+		OpsFlagEnterShip|OpsFlagEnterFlagship|OpsFlagLeaveShip|OpsFlagLeaveFlagship|OpsFlagBuildShip|OpsFlagBuildFlagship|OpsFlagBuildWarBase|OpsFlagBuildSciBase|OpsFlagBuildShipyard|OpsFlagItemToHyperspace
+		|OpsFlagNeutralBuild|OpsFlagKlingBuild
+		|OpsFlagWinOccupyHomeworld
+		|OpsFlagWormholeFast|OpsFlagWormholeRoam
+		|OpsFlagEnterTransport|OpsFlagLeaveTransport
+		|OpsFlagPlayerExp
+		|OpsFlagBuilding;
+
+	m_OpsModuleMul=1;
+	m_OpsModuleAdd=10;
+	m_OpsCostBuildLvl=256;
+	m_OpsSpeedCapture=5;
+	m_OpsSpeedBuild=256;
+	m_OpsRestartCooldown=0;
+	m_OpsStartTime=0;
+	m_OpsPulsarActive=0;
+	m_OpsPulsarPassive=0;
+	m_OpsWinScore=0;
+	m_OpsRewardExp=0;
+	m_OpsMaxRating=0;
+	m_OpsPriceEnter=0;
+	m_OpsPriceEnterType=0;
+	m_OpsPriceCapture=0;
+	m_OpsPriceCaptureType=0;
+	m_OpsPriceCaptureEgm=0;
+	m_OpsProtectCooldown=0;
+	m_OpsTeamOwner=-1;
+	m_OpsTeamEnemy=-1;
+	m_OpsJumpRadius=DefaultJumpRadius;
+	JumpRadius2=m_OpsJumpRadius*m_OpsJumpRadius;
+	for(i=0;i<TalentCnt;i++) { m_OpsPlayerFlagshipTalentOff[i]=0; m_OpsPlayerFlagshipTalentOn[i]=0; }
+}
+
+void CEmpire::InitOpsForUserCotlTraining()
+{
+	int i;
+
+	m_OpsFlag=
+		OpsFlagEnterShip|OpsFlagEnterFlagship|OpsFlagLeaveShip|OpsFlagLeaveFlagship|OpsFlagBuildShip|OpsFlagBuildFlagship|OpsFlagBuildWarBase|OpsFlagBuildSciBase|OpsFlagBuildShipyard|OpsFlagItemToHyperspace
+		|OpsFlagWinOccupyHomeworld
+		|OpsFlagEnterTransport|OpsFlagLeaveTransport
+		|OpsFlagPlayerExp
+		|OpsFlagBuilding;
+
+	m_OpsModuleMul=1;
+	m_OpsModuleAdd=10;
+	m_OpsCostBuildLvl=256;
+	m_OpsSpeedCapture=20;
+	m_OpsSpeedBuild=26;
+	m_OpsRestartCooldown=0;
+	m_OpsStartTime=0;
+	m_OpsPulsarActive=0;
+	m_OpsPulsarPassive=0;
+	m_OpsWinScore=0;
+	m_OpsRewardExp=0;
+	m_OpsMaxRating=0;
+	m_OpsPriceEnter=0;
+	m_OpsPriceEnterType=0;
+	m_OpsPriceCapture=0;
+	m_OpsPriceCaptureType=0;
+	m_OpsPriceCaptureEgm=0;
+	m_OpsProtectCooldown=0;
+	m_OpsTeamOwner=-1;
+	m_OpsTeamEnemy=-1;
+	m_OpsJumpRadius=DefaultJumpRadius;
+	JumpRadius2=m_OpsJumpRadius*m_OpsJumpRadius;
+	for(i=0;i<TalentCnt;i++) { m_OpsPlayerFlagshipTalentOff[i]=0; m_OpsPlayerFlagshipTalentOn[i]=0; }
+}
+
+void CEmpire::Ready()
+{
+	m_Calc->CalcRel();
+	MMPlanetPosCreate();
+	IslandCalc();
+	NoWormholeZoneCalc();
+	CalcLandingPlace();
+	CalcFieldSupplyPlanet();
+
+	if(m_CotlType) g_EMM->CotlStatDel(m_CotlId); // Правильно! Удаляем старую статистику. Так как если нужно то запишится новая.
+	CalcUserStat();
+	CalcUserStat();
+
+	m_AutoSaveGTime=m_Calc->m_GlobalTime;
+	m_KlingBirthTime=m_HLTime=m_AutoImportExportTime=m_ScoreSaveTime=m_UpdateStatTime=m_TicketTime=m_ShieldGlobalTime=m_AICalcTime=m_CotlSynTime=m_CotlSynTimeSend=m_CalcTime;
+	m_SupplyTime=m_CalcTime;
+
+	m_ReadyGTime=m_Calc->m_GlobalTime;
+	m_ExitTestGTime=m_ReadyGTime+60;
+	if(m_CotlType==SEmpireCotl::TypeProtect) SetPulsarStateProtect();
+
+	if(m_CotlType==SEmpireCotl::TypeCombat && !IsEdit()) {
+		m_GameTime=m_ReadyGTime+60;
+		m_GameState|=GameStatePlacing;
+	}
+
+//	AICalcProtect();
+	AICalc();
+
+	m_AIDestroyCnt=0;
+	m_Ready=true;
+
+	ItemBonusUpdate();
+
+	g_EMM->ServerUpdate(m_ServerNum,m_CalcNum,m_CotlId);
+
+	UpdateStat();
+
+	UpdateCotlSyn(true);
+
+if(g_EmpireEdit) m_LogBattle=m_CotlType==SEmpireCotl::TypeCombat;
+}
+
+void CEmpire::CotlNew(byte setrace)
+{
+	m_Rnd.Set(clock() ^ my_time() ^ m_ServerNum); m_Rnd.RndEx();
+
+	CreateMap(m_CotlSize,m_CotlSize);
+	InitOpsForUserCotl();
+
+	if(setrace) {
+		SPlanet * planet;
+		int i,u;
+		int cnt=m_SectorCntX*m_SectorCntY;
+		SSector * sec=m_Sector;
+		for(i=0;i<cnt;i++,sec++) {
+			planet=sec->m_Planet;
+			for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+				if(planet->m_Flag & (PlanetFlagWormhole | PlanetFlagSun | PlanetFlagGigant)) continue;
+				if(planet->m_Race) planet->m_Race=setrace;
+			}
+		}
+	}
+
+	m_Calc->CalcRel();
+	MMPlanetPosCreate();
+	IslandCalc();
+	NoWormholeZoneCalc();
+	CalcFieldSupplyPlanet();
+
+	ALogFormat("CotlNew <i> <s> <i>",m_ServerId,m_ServerName,m_ServerNum);
+}
+
+void CEmpire::Save()
+{
+//    Terminate();
+//    WaitEnd();
+
+	if(m_Cotl) {
+		if(m_CotlId) {
+			CStr data(m_Heap);
+			data.SetAlignShift(16);
+			CotlSave(data);
+			g_EMM->CotlWorldSave(m_CotlId,false,data.GetConst(),data.Len());
+
+			data.Clear();
+			CotlShortSave(data);
+			g_EMM->CotlWorldSave(m_CotlId,true,data.GetConst(),data.Len());
+		}
+	} else {
+//		CStr tstr(m_Heap);
+
+//		tstr.Format("<s>empire.sav",DPath);
+//		Save(tstr.GetConst(),tstr.Len());
+	}
+}
+
+//void CEmpire::Backup()
+//{
+//	CStr tstr(m_Heap);
+//	CStr tstr2(m_Heap);
+
+//	tstr.Format("<s>empire.sav",DPath);
+//	tstr2.Format("<s>empire.bak",DPath);
+//	rename(tstr.GetConst(),tstr2.GetConst());
+//}
+
+struct SRefToPlanet {
+	int m_Type; // 1-path 2-route 3-portal 4-ship from auto return 5-link
+	int m_Dir; // 1=to move 2-from move
+	int m_SecX;
+	int m_SecY;
+	int m_PlanetNum;
+	int m_ShipNum;
+};
+
+void CEmpire::PlanetMoveMem(CEmpire::SPlanet * des,CEmpire::SPlanet * src)
+{
+	int i;
+
+	GangClearAll();
+
+	SSector * sec=des->m_Sector;
+	int planetnum=des->m_PlanetNum;
+	MemCopy(des,src,sizeof(SPlanet));
+	des->m_Sector=sec;
+	des->m_PlanetNum=planetnum;
+	SShip * ship=des->m_Ship;
+	for(i=0;i<ShipOnPlanetMax;i++,ship++) {
+		ship->m_Planet=des;
+		ship->m_ShipNum=i;
+	}
+
+	sec=src->m_Sector;
+	planetnum=src->m_PlanetNum;
+	MemZero(src,sizeof(SPlanet));
+	src->m_Sector=sec;
+	src->m_PlanetNum=planetnum;
+	ship=src->m_Ship;
+	for(i=0;i<ShipOnPlanetMax;i++,ship++) {
+		ship->m_Planet=src;
+		ship->m_ShipNum=i;
+	}
+}
+
+int PlanetClearRef(CEmpire * emp,int secx,int secy,int planetnum,SRefToPlanet * ref_list=NULL,int ref_max=0)
+{
+	int i,u,x,y,tx,ty,tp,k;
+	int ref_add=0;
+	CEmpire::SPlanet * planet;
+	CEmpire::SSector * sec=emp->m_Sector;
+	for(y=emp->m_SectorMinY;y<emp->m_SectorMinY+emp->m_SectorCntY;y++) {
+		for(x=emp->m_SectorMinX;x<emp->m_SectorMinX+emp->m_SectorCntX;x++,sec++) {
+			bool change=false;
+
+			planet=sec->m_Planet;
+			for(i=0;i<sec->m_PlanetCnt;i++,planet++) {
+				CEmpire::SShip * ship=planet->m_Ship;
+				for(u=0;u<CEmpire::ShipOnPlanetMax;u++,ship++) {
+					if(ship->m_Type==CEmpire::ShipTypeNone) continue;
+					if(ship->m_PathMove) emp->PathMoveClearInner(ship,false);
+				}
+
+				if(planet->m_Sector->m_SectorX==secx && planet->m_Sector->m_SectorY==secy && planet->m_PlanetNum==planetnum) continue;
+
+				while(planet->m_Path) {
+					emp->CalcFromPlanetOffset(x,y,planet->m_Path,&tx,&ty,&tp);
+					if(tx==secx && ty==secy && tp==planetnum)  {
+						planet->m_Path=0; change=true;
+//ALogFormat("!!!RefAdd Path <i>,<i>,<i>",x,y,i);
+						if(ref_list && ref_add<ref_max) { ref_list->m_Type=1; ref_list->m_Dir=1; ref_list->m_SecX=x; ref_list->m_SecY=y; ref_list->m_PlanetNum=i; ref_list->m_ShipNum=-1; ref_list++; ref_add++; }
+						break;
+					}
+					break;
+				}
+				for(k=0;k<CEmpire::RouteMax;k++) {
+					while(planet->m_RouteList[k]) {
+			            emp->CalcFromPlanetOffset(x,y,planet->m_RouteList[k],&tx,&ty,&tp);
+						if(tx==secx && ty==secy && tp==planetnum)  {
+							planet->m_RouteList[k]=0; change=true;
+//ALogFormat("!!!RefAdd Route <i>,<i>,<i>",x,y,i);
+							if(ref_list && ref_add<ref_max) { ref_list->m_Type=2; ref_list->m_Dir=1; ref_list->m_SecX=x; ref_list->m_SecY=y; ref_list->m_PlanetNum=i; ref_list->m_ShipNum=-1; ref_list++; ref_add++; }
+							break;
+						}
+						break;
+					}
+				}
+
+				if(planet->m_PortalPlanet!=0 && planet->m_PortalCotlId==0 && planet->m_PortalSectorX==secx && planet->m_PortalSectorY==secy && planet->m_PortalPlanet==planetnum+1) {
+					planet->m_PortalPlanet=0;
+					planet->m_PortalSectorX=0;
+					planet->m_PortalSectorY=0;
+					planet->m_PortalCnt=0;
+					planet->m_PortalOwner=0;
+					planet->m_PortalCotlId=0;
+					planet->m_PortalOwner=0;
+					if(planet->m_Flag & CEmpire::PlanetFlagWormhole) { planet->m_Owner=0; planet->m_Flag &=~(CEmpire::PlanetFlagWormholePrepare|CEmpire::PlanetFlagWormholeOpen|CEmpire::PlanetFlagWormholeClose|CEmpire::PlanetFlagWormholeFast|CEmpire::PlanetFlagLarge); }
+					change=true;
+					if(ref_list && ref_add<ref_max) { ref_list->m_Type=3; ref_list->m_Dir=1; ref_list->m_SecX=x; ref_list->m_SecY=y; ref_list->m_PlanetNum=i; ref_list->m_ShipNum=-1; ref_list++; ref_add++; }
+				}
+
+				ship=planet->m_Ship;
+				for(u=0;u<CEmpire::ShipOnPlanetMax;u++,ship++) {
+					if(ship->m_Type==CEmpire::ShipTypeNone) continue;
+
+//@					if(ship->m_FromSectorX==secx && ship->m_FromSectorY==secy && ship->m_FromPlanet==planetnum && (ship->m_Flag & CEmpire::ShipFlagAutoReturn)) {
+//@						ship->m_FromSectorX=x;
+//@						ship->m_FromSectorY=y;
+//@						ship->m_FromPlanet=i;
+//@						ship->m_FromPlace=u;
+//@						ship->m_Flag&=~(CEmpire::ShipFlagAutoReturn|CEmpire::ShipFlagAINeedReturn);
+//@						change=true;
+//@						if(ref_list && ref_add<ref_max) { ref_list->m_Type=4; ref_list->m_Dir=1; ref_list->m_SecX=x; ref_list->m_SecY=y; ref_list->m_PlanetNum=i; ref_list->m_ShipNum=u; ref_list++; ref_add++; }
+//@					}
+					if(emp->LinkEq(ship,secx,secy,planetnum)) {
+						ship->m_Link=0;
+						if(ref_list && ref_add<ref_max) { ref_list->m_Type=5; ref_list->m_Dir=1; ref_list->m_SecX=x; ref_list->m_SecY=y; ref_list->m_PlanetNum=i; ref_list->m_ShipNum=u; ref_list++; ref_add++; }
+					}
+/*					while(ship->m_PathMove) {
+						if(ship->m_PathMove->m_SectorX==secx && ship->m_PathMove->m_SectorY==secy && ship->m_PathMove->m_PlanetNum==planetnum) {
+							emp->PathMoveClearInner(ship,false);
+							change=true;
+							break;
+						}
+
+						if(!(ship->m_PathMove->m_SectorX==x && ship->m_PathMove->m_SectorY==y && ship->m_PathMove->m_PlanetNum==i)) {
+							emp->PathMoveClearInner(ship,false);
+							change=true;
+							break;
+						} else if(ship->m_PathMove->m_Cur>=ship->m_PathMove->m_Cnt) {
+	        			    emp->PathMoveClearInner(ship,false);
+							change=true;
+							break;
+						}
+
+						int csx=x;
+						int csy=y;
+						int cpn=i;
+						int k=ship->m_PathMove->m_Cur;
+						int nx,ny,np;
+
+						for(;k<ship->m_PathMove->m_Cnt;k++) {
+							emp->CalcFromPlanetOffset(csx,csy,ship->m_PathMove->m_Path[k],&nx,&ny,&np);
+							if(nx==secx && ny==secy && np==planetnum) {
+								break;
+							}
+							csx=nx;
+							csy=ny;
+							cpn=np;
+						}
+						if(k<ship->m_PathMove->m_Cnt) {
+							emp->PathMoveClearInner(ship);
+							change=true;
+							break;
+						}
+
+						break;
+					}*/
+				}
+			}
+			if(change) sec->m_Ver++;
+		}
+	}
+	return ref_add;
+}
+
+void PlanetChangeNum(CEmpire * emp,int secx,int secy,int tonum,int fromnum,SRefToPlanet * ref_list=NULL,int ref_cnt=0)
+{
+	if(!emp->m_PlanetGrow) ERROR_E;
+
+	int i,u,x,y,tx,ty,tp,k;
+	CEmpire::SPlanet * planet;
+
+	SRefToPlanet * r=ref_list;
+	for(i=0;i<ref_cnt;i++,r++) {
+		if(r->m_SecX!=secx) continue;
+		if(r->m_SecY!=secy) continue;
+		if(r->m_PlanetNum!=fromnum) continue;
+
+		r->m_PlanetNum=tonum;
+//ALogFormat("!!!PlanetChangeNum ref Type=<i>,<i> Planet=<i>,<i>,<i> to <i>",r->m_Type,r->m_Dir,r->m_SecX,r->m_SecY,fromnum,tonum);
+	}
+
+	CEmpire::SSector * sec=emp->m_Sector;
+	for(y=emp->m_SectorMinY;y<emp->m_SectorMinY+emp->m_SectorCntY;y++) {
+		for(x=emp->m_SectorMinX;x<emp->m_SectorMinX+emp->m_SectorCntX;x++,sec++) {
+			bool change=false;
+
+			planet=sec->m_Planet;
+			for(i=0;i<sec->m_PlanetCnt;i++,planet++) {
+				while(planet->m_Path) {
+					emp->CalcFromPlanetOffset(x,y,planet->m_Path,&tx,&ty,&tp);
+					if(tx==secx && ty==secy && tp==fromnum)  {
+						planet->m_Path=emp->CalcPlanetOffset(x,y,i,secx,secy,tonum);
+						change=true;
+					}
+					break;
+				}
+				for(k=0;k<CEmpire::RouteMax;k++) {
+					while(planet->m_RouteList[k]) {
+			            emp->CalcFromPlanetOffset(x,y,planet->m_RouteList[k],&tx,&ty,&tp);
+						if(tx==secx && ty==secy && tp==fromnum)  {
+							planet->m_RouteList[k]=emp->CalcPlanetOffset(x,y,i,secx,secy,tonum);
+							change=true;
+						}
+						break;
+					}
+				}
+
+				if(planet->m_PortalPlanet!=0 && planet->m_PortalCotlId==0 && planet->m_PortalSectorX==secx && planet->m_PortalSectorY==secy && planet->m_PortalPlanet==fromnum+1) {
+					planet->m_PortalPlanet=tonum+1;
+					change=true;
+				}
+
+				CEmpire::SShip * ship=planet->m_Ship;
+				for(u=0;u<CEmpire::ShipOnPlanetMax;u++,ship++) {
+					if(ship->m_Type==CEmpire::ShipTypeNone) continue;
+
+					if(ship->m_FromSectorX==secx && ship->m_FromSectorY==secy && ship->m_FromPlanet==fromnum) {
+						ship->m_FromPlanet=tonum;
+						change=true;
+					}
+					while(ship->m_PathMove) {
+						if(ship->m_PathMove->m_SectorX==secx && ship->m_PathMove->m_SectorY==secy && ship->m_PathMove->m_PlanetNum==fromnum) {
+							ship->m_PathMove->m_PlanetNum=tonum;
+							change=true;
+						}
+
+						if(!(ship->m_PathMove->m_SectorX==x && ship->m_PathMove->m_SectorY==y && ship->m_PathMove->m_PlanetNum==i)) {
+							emp->PathMoveClearInner(ship,false);
+							change=true;
+							break;
+						} else if(ship->m_PathMove->m_Cur>=ship->m_PathMove->m_Cnt) {
+	        			    emp->PathMoveClearInner(ship,false);
+							change=true;
+							break;
+						}
+
+						int csx=x;
+						int csy=y;
+						int cpn=i;
+						int k=ship->m_PathMove->m_Cur;
+						int nx,ny,np;
+
+						for(;k<ship->m_PathMove->m_Cnt;k++) {
+							emp->CalcFromPlanetOffset(csx,csy,ship->m_PathMove->m_Path[k],&nx,&ny,&np);
+							if(nx==secx && ny==secy && np==fromnum) {
+								ship->m_PathMove->m_Path[k]=emp->CalcPlanetOffset(csx,csy,cpn,nx,ny,tonum);
+								np=tonum;
+								change=true;
+								if(ship->m_PathMove->m_Path[k]==0) break;
+							}
+							csx=nx;
+							csy=ny;
+							cpn=np;
+						}
+						if(k<ship->m_PathMove->m_Cnt) {
+							emp->PathMoveClearInner(ship);
+							change=true;
+							break;
+						}
+
+						break;
+					}
+
+					while(ship->m_Link) {
+						emp->LinkExtract(ship,&tx,&ty,&tp);
+						if(tx==secx && ty==secy && tp==fromnum)  {
+							emp->LinkSetEx(ship,secx,secy,tonum);
+							change=true;
+						}
+						break;
+					}
+
+				}
+			}
+			if(change) sec->m_Ver++;
+		}
+	}
+}
+
+bool CEmpire::PlanetMove(CEmpire::SPlanet * planet,int nx,int ny)
+{
+	if(!m_PlanetGrow) ERROR_E;
+
+	int i,tx,ty,tp,ax,ay,r,br,fx,fy,u;
+	SSector * sec;
+	SPlanet * curplanet;
+	SShip * ship;
+
+	int nsx=nx/SectorSize; if(nx<0 && (nx % SEmpireZone::Size)) nsx-=1;
+	int nsy=ny/SectorSize; if(ny<0 && (ny % SEmpireZone::Size)) nsy-=1;
+	if(nsx<m_SectorMinX || nsx>=m_SectorMinX+m_SectorCntX) return false;
+	if(nsy<m_SectorMinY || nsy>=m_SectorMinY+m_SectorCntY) return false;
+
+	SSector * tosec=GetSector(nsx,nsy);
+	if(!tosec) return false;
+
+    if(planet->m_Sector->m_SectorX==nsx && planet->m_Sector->m_SectorY==nsy) {
+    } else {
+        if(tosec->m_PlanetCnt>=PlanetOnSectorMaxSys) return false;
+
+        if(tosec->m_PlanetCnt>0 && (tosec->m_Planet[tosec->m_PlanetCnt-1].m_Flag & PlanetFlagWormhole)) {
+            if(planet->m_Flag & PlanetFlagWormhole) return false;
+		}
+	}
+
+	// Находим ближайшее свободное место для планеты
+	int pfrom=PlanetMinDist/4;
+	int pto=SectorSize-PlanetMinDist/4;
+
+	br=-1;
+	for(ty=pfrom;ty<pto;ty++) {
+		for(tx=pfrom;tx<pto;tx++) {
+			ax=tx+SectorSize*nsx;
+			ay=ty+SectorSize*nsy;
+
+            if(!IsCorrectPlaceForPlanet(ax,ay,nsx,nsy,50,0,planet)) continue;
+
+			r=(nx-ax)*(nx-ax)+(ny-ay)*(ny-ay);
+			if(br<0 || r<br) {
+				br=r;
+				fx=ax;
+				fy=ay;
+			}
+		}
+	}
+	if(br<0) return false;
+
+	// Запоминаем ссылки на планету
+/*	static const int pathmax=32;
+	SPlanet * pathlist[pathmax];
+	int pathcnt=0;
+
+	int fsx=max(m_SectorMinX,planet->m_Sector->m_SectorX-1);
+	int fsy=max(m_SectorMinY,planet->m_Sector->m_SectorY-1);
+	int esx=min(m_SectorMinX+m_SectorCntX,planet->m_Sector->m_SectorX+2);
+	int esy=min(m_SectorMinY+m_SectorCntY,planet->m_Sector->m_SectorY+2);
+
+//ALogFormat("!!!PlanetMove00");
+	SSector * cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+	for(int sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+		for(int sx=fsx;sx<esx;sx++,cursec++) {
+			curplanet=cursec->m_Planet;
+			for(i=0;i<cursec->m_PlanetCnt;i++,curplanet++) {
+				if(curplanet==planet) continue;
+
+				if(curplanet->m_Path) {
+		            CalcFromPlanetOffset(sx,sy,curplanet->m_Path,&tx,&ty,&tp);
+					if(sx==planet->m_Sector->m_SectorX && sy==planet->m_Sector->m_SectorY && tp==planet->m_PlanetNum) {
+						if(pathcnt>=pathmax) ERROR_E;
+						pathlist[pathcnt]=curplanet;
+						pathcnt++;
+//ALogFormat("!!!PlanetMove01 SaveFrom <i>,<i>,<i>",curplanet->m_Sector->m_SectorX,curplanet->m_Sector->m_SectorY,curplanet->m_PlanetNum);
+					}
+				}
+			}
+		}
+	}*/
+
+	// Отчищаем все ссылки на планету
+	const int ref_max=512;
+	SRefToPlanet ref_list[ref_max];
+	int ref_cnt=0;
+
+	planet->m_Sector->m_Ver++;
+
+	dword wf=planet->m_Flag & (PlanetFlagWormholePrepare|PlanetFlagWormholeOpen|PlanetFlagWormholeClose|PlanetFlagWormholeFast|PlanetFlagWormhole|PlanetFlagLarge);
+	int portalcnt=planet->m_PortalCnt;
+	dword portalowner=planet->m_PortalOwner;
+	planet->m_PortalPlanet=0;
+	planet->m_PortalSectorX=0;
+	planet->m_PortalSectorY=0;
+	planet->m_PortalCnt=0;
+	planet->m_PortalOwner=0;
+	planet->m_PortalCotlId=0;
+	planet->m_PortalOwner=0;
+	if(planet->m_Flag & PlanetFlagWormhole) planet->m_Flag &=~(PlanetFlagWormholePrepare|PlanetFlagWormholeOpen|PlanetFlagWormholeClose|PlanetFlagWormholeFast|PlanetFlagLarge);
+
+	if(planet->m_Path!=0) {
+		if(ref_cnt<ref_max) {
+			CalcFromPlanetOffset(planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,planet->m_Path,&(ref_list[ref_cnt].m_SecX),&(ref_list[ref_cnt].m_SecY),&(ref_list[ref_cnt].m_PlanetNum));
+			ref_list[ref_cnt].m_Type=1;
+			ref_list[ref_cnt].m_Dir=2;
+			ref_list[ref_cnt].m_ShipNum=-1;
+//ALogFormat("!!!PM00 FromPath <i> <i> <i>",ref_list[ref_cnt].m_SecX,ref_list[ref_cnt].m_SecY,ref_list[ref_cnt].m_PlanetNum);
+			ref_cnt++;
+		}
+		planet->m_Path=0;
+	}
+
+	for(i=0;i<RouteMax;i++) {
+		if(planet->m_RouteList[i]==0) continue;
+
+		if(ref_cnt<ref_max) {
+			CalcFromPlanetOffset(planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,planet->m_RouteList[i],&(ref_list[ref_cnt].m_SecX),&(ref_list[ref_cnt].m_SecY),&(ref_list[ref_cnt].m_PlanetNum));
+			ref_list[ref_cnt].m_Type=2;
+			ref_list[ref_cnt].m_Dir=2;
+			ref_list[ref_cnt].m_ShipNum=-1;
+			ref_cnt++;
+		}
+
+		planet->m_RouteList[i]=0;
+	}
+
+	ship=planet->m_Ship;
+	for(u=0;u<CEmpire::ShipOnPlanetMax;u++,ship++) {
+		if(ship->m_Type==CEmpire::ShipTypeNone) continue;
+
+//@		if(ship->m_Flag & CEmpire::ShipFlagAutoReturn) {
+//@			if(ref_cnt<ref_max && !(ship->m_FromSectorX==planet->m_Sector->m_SectorX && ship->m_FromSectorY==planet->m_Sector->m_SectorY && ship->m_FromPlanet==planet->m_PlanetNum)) {
+//@				ref_list[ref_cnt].m_Type=4;
+//@				ref_list[ref_cnt].m_Dir=2;
+//@				ref_list[ref_cnt].m_SecX=ship->m_FromSectorX;
+//@				ref_list[ref_cnt].m_SecY=ship->m_FromSectorY;
+//@				ref_list[ref_cnt].m_PlanetNum=ship->m_FromPlanet;
+//@				ref_list[ref_cnt].m_ShipNum=u;
+//@				ref_cnt++;
+//@			}
+//@			ship->m_FromSectorX=planet->m_Sector->m_SectorX;
+//@			ship->m_FromSectorY=planet->m_Sector->m_SectorY;
+//@			ship->m_FromPlanet=planet->m_PlanetNum;
+//@			ship->m_FromPlace=ship->m_ShipNum;
+//@			ship->m_Flag&=~(CEmpire::ShipFlagAutoReturn|CEmpire::ShipFlagAINeedReturn);
+//@		}
+		if(ship->m_Link) {
+			SPlanet * p2=Link(ship);
+//ALogFormat("!!!LS id:<b=16><u> Link:<u> p2:<u>",ship->m_Id,ship->m_Link,p2);
+			if(p2 && ref_cnt<ref_max) {
+				ref_list[ref_cnt].m_Type=5;
+				if(p2==ship->m_Planet) {
+					ref_list[ref_cnt].m_Dir=3;
+					ref_list[ref_cnt].m_SecX=0;
+					ref_list[ref_cnt].m_SecY=0;
+					ref_list[ref_cnt].m_PlanetNum=-1;
+					ref_list[ref_cnt].m_ShipNum=u;
+//ALogFormat("!!!LS id:<b=16><u> dirself",ship->m_Id);
+					ref_cnt++;
+				}
+				else {
+					ref_list[ref_cnt].m_Dir=2;
+					ref_list[ref_cnt].m_SecX=p2->m_Sector->m_SectorX;
+					ref_list[ref_cnt].m_SecY=p2->m_Sector->m_SectorY;
+					ref_list[ref_cnt].m_PlanetNum=p2->m_PlanetNum;
+					ref_list[ref_cnt].m_ShipNum=u;
+//ALogFormat("!!!LS id:<b=16><u> dirto",ship->m_Id);
+					ref_cnt++;
+				}
+			}
+			ship->m_Link=0;
+		}
+	}
+
+	ref_cnt+=PlanetClearRef(this,planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,planet->m_PlanetNum,ref_list+ref_cnt,ref_max-ref_cnt);
+
+	ship=planet->m_Ship;
+	for(i=0;i<ShipOnPlanetMax;i++,ship++) {
+		if(ship->m_Type==ShipTypeNone) continue;
+		ship->m_Flag |= ShipFlagExchange;
+	}
+
+	// Переносим планету
+	SPlanet * desplanet=NULL;
+
+	if(planet->m_Sector->m_SectorX==nsx && planet->m_Sector->m_SectorY==nsy) {
+		desplanet=planet;
+	} else {
+		if(tosec->m_PlanetCnt>=PlanetOnSectorMaxSys) ERROR_E;
+
+		if(tosec->m_PlanetCnt>0 && (tosec->m_Planet[tosec->m_PlanetCnt-1].m_Flag & PlanetFlagWormhole)) {
+			if(planet->m_Flag & PlanetFlagWormhole) ERROR_E;
+			PlanetMoveMem(tosec->m_Planet+tosec->m_PlanetCnt,tosec->m_Planet+tosec->m_PlanetCnt-1);
+			PlanetChangeNum(this,tosec->m_SectorX,tosec->m_SectorY,tosec->m_PlanetCnt,tosec->m_PlanetCnt-1,ref_list,ref_cnt);
+			desplanet=tosec->m_Planet+tosec->m_PlanetCnt-1;
+		} else {
+			desplanet=tosec->m_Planet+tosec->m_PlanetCnt;
+		}
+		PlanetMoveMem(desplanet,planet);
+		tosec->m_PlanetCnt++;
+
+		for(i=planet->m_PlanetNum+1;i<planet->m_Sector->m_PlanetCnt;i++) {
+			PlanetMoveMem(planet->m_Sector->m_Planet+i-1,planet->m_Sector->m_Planet+i);
+//ALogFormat("!!!PM.CPCN00 <i>,<i>,<i> to:<i>",planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,i,i-1);
+			PlanetChangeNum(this,planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,i-1,i,ref_list,ref_cnt);
+		}
+		planet->m_Sector->m_PlanetCnt--;
+	}
+
+	desplanet->m_PosX=fx;
+	desplanet->m_PosY=fy;
+	desplanet->m_Sector->m_Ver++;
+
+	// Восстанавливаем те ссылки которые возможны
+	SRefToPlanet * ru=ref_list;
+	for(i=0;i<ref_cnt;i++,ru++) {
+		if(ru->m_Type==5 && ru->m_Dir==3) {
+			if(ru->m_ShipNum<0 || ru->m_ShipNum>=ShipOnPlanetMax) continue;
+			ship=desplanet->m_Ship+ru->m_ShipNum;
+
+//ALogFormat("!!!LS_set id:<b=16><u> dirself",ship->m_Id);
+			LinkSet(ship,desplanet);
+			desplanet->m_Sector->m_Ver++;
+			continue;
+		}
+
+		sec=GetSector(ru->m_SecX,ru->m_SecY);
+		if(!sec) continue;
+		if(ru->m_PlanetNum<0 || ru->m_PlanetNum>=sec->m_PlanetCnt) continue;
+		planet=sec->m_Planet+ru->m_PlanetNum;
+
+		bool ijr=false;
+		tx=desplanet->m_PosX-planet->m_PosX;
+		ty=desplanet->m_PosY-planet->m_PosY;
+		if(tx<=m_OpsJumpRadius && ty<=m_OpsJumpRadius) {
+			ijr=(tx*tx+ty*ty)<=JumpRadius2;
+		}
+
+		if(ru->m_Type==1) {
+			if(!ijr) continue;
+			if(ru->m_Dir==2) {
+//ALogFormat("!!!PM01 FromPath <i> <i> <i>",ru->m_SecX,ru->m_SecY,ru->m_PlanetNum);
+				desplanet->m_Path=CalcPlanetOffset(desplanet->m_Sector->m_SectorX,desplanet->m_Sector->m_SectorY,desplanet->m_PlanetNum,planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,planet->m_PlanetNum);
+			} else {
+				planet->m_Path=CalcPlanetOffset(planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,planet->m_PlanetNum,desplanet->m_Sector->m_SectorX,desplanet->m_Sector->m_SectorY,desplanet->m_PlanetNum);
+			}
+		} else if(ru->m_Type==2) {
+			if(!ijr) continue;
+			for(u=0;u<RouteMax;u++) {
+				if(ru->m_Dir==2) {
+					if(desplanet->m_RouteList[u]==0) {
+						desplanet->m_RouteList[u]=CalcPlanetOffset(desplanet->m_Sector->m_SectorX,desplanet->m_Sector->m_SectorY,desplanet->m_PlanetNum,planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,planet->m_PlanetNum);
+						break;
+					}
+				} else {
+					if(planet->m_RouteList[u]==0) {
+						planet->m_RouteList[u]=CalcPlanetOffset(planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,planet->m_PlanetNum,desplanet->m_Sector->m_SectorX,desplanet->m_Sector->m_SectorY,desplanet->m_PlanetNum);
+						break;
+					}
+				}
+			}
+		} else if(ru->m_Type==3) {
+			planet->m_PortalSectorX=desplanet->m_Sector->m_SectorX;
+			planet->m_PortalSectorY=desplanet->m_Sector->m_SectorY;
+			planet->m_PortalPlanet=desplanet->m_PlanetNum+1;
+			planet->m_PortalCnt=portalcnt;
+			planet->m_PortalOwner=portalowner;
+			if(planet->m_Flag & PlanetFlagWormhole) planet->m_Flag|=wf;
+
+			desplanet->m_PortalSectorX=planet->m_Sector->m_SectorX;
+			desplanet->m_PortalSectorY=planet->m_Sector->m_SectorY;
+			desplanet->m_PortalPlanet=planet->m_PlanetNum+1;
+			desplanet->m_PortalCnt=portalcnt;
+			desplanet->m_PortalOwner=portalowner;
+			if(desplanet->m_Flag & PlanetFlagWormhole) desplanet->m_Flag|=wf;
+
+//@		} else if(ru->m_Type==4 && ru->m_Dir==1) {
+//@			if(!ijr) continue;
+//@			if(ru->m_ShipNum<0 || ru->m_ShipNum>=ShipOnPlanetMax) continue;
+//@			ship=planet->m_Ship+ru->m_ShipNum;
+//@
+//@			ship->m_Flag &= ~(ShipFlagAutoReturn|ShipFlagAutoLogic);
+//@			ship->m_Flag |= ShipFlagAutoReturn;
+//@			ship->m_FromSectorX=desplanet->m_Sector->m_SectorX;
+//@			ship->m_FromSectorY=desplanet->m_Sector->m_SectorY;
+//@			ship->m_FromPlanet=desplanet->m_PlanetNum;
+//@
+//@		} else if(ru->m_Type==4 && ru->m_Dir==2) {
+//@			if(!ijr) continue;
+//@			if(ru->m_ShipNum<0 || ru->m_ShipNum>=ShipOnPlanetMax) continue;
+//@			ship=desplanet->m_Ship+ru->m_ShipNum;
+//@
+//@			ship->m_Flag &= ~(ShipFlagAutoReturn|ShipFlagAutoLogic);
+//@			ship->m_Flag |= ShipFlagAutoReturn;
+//@			ship->m_FromSectorX=planet->m_Sector->m_SectorX;
+//@			ship->m_FromSectorY=planet->m_Sector->m_SectorY;
+//@			ship->m_FromPlanet=planet->m_PlanetNum;
+
+		} else if(ru->m_Type==5 && ru->m_Dir==1) {
+			if(!ijr) continue;
+			if(ru->m_ShipNum<0 || ru->m_ShipNum>=ShipOnPlanetMax) continue;
+			ship=planet->m_Ship+ru->m_ShipNum;
+
+			LinkSet(ship,desplanet);
+
+		} else if(ru->m_Type==5 && ru->m_Dir==2) {
+			if(!ijr) continue;
+			if(ru->m_ShipNum<0 || ru->m_ShipNum>=ShipOnPlanetMax) continue;
+			ship=desplanet->m_Ship+ru->m_ShipNum;
+//ALogFormat("!!!LS_set id:<b=16><u> dirto",ship->m_Id);
+
+			LinkSet(ship,planet);
+		}
+
+		planet->m_Sector->m_Ver++;
+	}
+
+//ALogFormat("!!!PM00 tosec:(<i>,<i>) desplanet:(<i>,<i>,<i>)",tosec->m_SectorX,tosec->m_SectorY,desplanet->m_Sector->m_SectorX,desplanet->m_Sector->m_SectorY,desplanet->m_PlanetNum);
+
+	return true;
+}
+
+CEmpire::SPlanet * CEmpire::PlanetAdd(int nx,int ny,dword flag,dword owner,int lvl,int race,int machinery,int engineer,int oreitem,int refuel,dword findmask)
+{
+	if(!m_PlanetGrow) ERROR_E;
+
+	int br,ax,ay,fx,fy,tx,ty,r;
+
+	int nsx=nx/SectorSize; if(nx<0 && (nx % SEmpireZone::Size)) nsx-=1;
+	int nsy=ny/SectorSize; if(ny<0 && (ny % SEmpireZone::Size)) nsy-=1;
+	if(nsx<m_SectorMinX || nsx>=m_SectorMinX+m_SectorCntX) return NULL;
+	if(nsy<m_SectorMinY || nsy>=m_SectorMinY+m_SectorCntY) return NULL;
+
+	SSector * tosec=GetSector(nsx,nsy);
+	if(!tosec) return NULL;
+
+	if(tosec->m_PlanetCnt>=PlanetOnSectorMaxSys) return NULL;
+	if((flag & PlanetFlagWormhole) && (tosec->m_PlanetCnt>0) && (tosec->m_Planet[tosec->m_PlanetCnt-1].m_Flag & PlanetFlagWormhole)) return NULL;
+
+	if(!owner);
+	else if(owner==OwnerAI0);
+	else if(owner==OwnerAI1);
+	else if(owner==OwnerAI2);
+	else if(owner==OwnerAI3);
+	else owner=0;
+
+	if(lvl<0) lvl=0;
+	else if(lvl>1000000) lvl=1000000;
+
+	if(race==RaceNone);
+	else if(race==RaceGrantar);
+	else if(race==RacePeleng);
+	else if(race==RacePeople);
+	else if(race==RaceTechnol);
+	else if(race==RaceGaal);
+	else race=RaceNone;
+
+//	if(module<0) module=0;
+//	else if(module>1000000000) module=1000000000;
+	if(machinery<0) machinery=0;
+	else if(machinery>255) machinery=255;
+	if(engineer<0) engineer=0;
+	else if(engineer>255) engineer=255;
+
+	if(oreitem==ItemTypeNone);
+	else if(oreitem==ItemTypeCrystal);
+	else if(oreitem==ItemTypeTitan);
+	else if(oreitem==ItemTypeSilicon);
+	else oreitem=ItemTypeNone;
+
+	if(refuel<-100) refuel=-100;
+	else if(refuel>100) refuel=100;
+
+//	if(buildtype<0 || buildtype>=ShipTypeCnt) return false;
+
+//	if(buildcnt<0) buildcnt=0;
+//	else if(buildcnt>30000) buildcnt=30000;
+
+//	if(buildtime<0) buildtime=0;
+//	else if(buildtime>24*60*60) buildcnt=24*60*60;
+
+//	if(buildwait<0) buildtime=0;
+//	else if(buildwait>24*60*60) buildcnt=24*60*60;
+
+	// Находим ближайшее свободное место для планеты
+	int pfrom=PlanetMinDist/4;
+	int pto=SectorSize-PlanetMinDist/4;
+
+	br=-1;
+	for(ty=pfrom;ty<pto;ty++) {
+		for(tx=pfrom;tx<pto;tx++) {
+			ax=tx+SectorSize*nsx;
+			ay=ty+SectorSize*nsy;
+
+            if(!IsCorrectPlaceForPlanet(ax,ay,nsx,nsy,50,0,NULL)) continue;
+
+			r=(nx-ax)*(nx-ax)+(ny-ay)*(ny-ay);
+			if(br<0 || r<br) {
+				br=r;
+				fx=ax;
+				fy=ay;
+			}
+		}
+	}
+	if(br<0) return NULL;
+
+	SPlanet * desplanet=NULL;
+
+	if((tosec->m_PlanetCnt>0) && (tosec->m_Planet[tosec->m_PlanetCnt-1].m_Flag & PlanetFlagWormhole)) {
+		PlanetMoveMem(tosec->m_Planet+tosec->m_PlanetCnt,tosec->m_Planet+tosec->m_PlanetCnt-1);
+		PlanetChangeNum(this,tosec->m_SectorX,tosec->m_SectorY,tosec->m_PlanetCnt,tosec->m_PlanetCnt-1);
+		desplanet=tosec->m_Planet+tosec->m_PlanetCnt-1;
+	} else {
+		desplanet=tosec->m_Planet+tosec->m_PlanetCnt;
+	}
+	tosec->m_PlanetCnt++;
+
+	desplanet->m_PosX=fx;
+	desplanet->m_PosY=fy;
+
+	desplanet->m_Flag|=flag & (PlanetFlagSun|PlanetFlagLarge|PlanetFlagWormhole|PlanetFlagGigant|PlanetFlagRich|PlanetFlagArrivalDef|PlanetFlagArrivalAtk|PlanetFlagNoCapture);
+	desplanet->m_Owner=owner;
+	desplanet->m_Level=lvl;
+	desplanet->m_Race=race;
+//	desplanet->m_ConstructionPoint=module;
+	desplanet->m_OreItem=oreitem;
+	desplanet->m_Team=-1;
+
+	desplanet->m_Refuel=refuel;
+	desplanet->m_FindMask=findmask;
+//	desplanet->m_AutoBuildType=buildtype;
+//	desplanet->m_AutoBuildCnt=buildcnt;
+//	desplanet->m_AutoBuildTime=buildtime;
+//	desplanet->m_AutoBuildWait=buildwait;
+
+	if(machinery!=0 || engineer!=0) {
+		m_Calc->PlanetVarPrepare(desplanet);
+		desplanet->m_Var->m_Machinery=machinery;
+		desplanet->m_Var->m_Engineer=engineer;
+	}
+
+	desplanet->m_Sector->m_Ver++;
+	desplanet->m_Sector->m_VerSlow++;
+
+	return desplanet;
+}
+
+bool CEmpire::PlanetChange(SPlanet * planet,dword flag,dword owner,int lvl,int race,int machinery,int engineer,int oreitem,int refuel,int team,dword findid,int timer)
+{
+	int i;
+
+	if(!owner);
+	else if(owner==OwnerAI0);
+	else if(owner==OwnerAI1);
+	else if(owner==OwnerAI2);
+	else if(owner==OwnerAI3);
+	else if(StatFind(owner));
+	else owner=0;
+
+	if(lvl<0) lvl=0;
+	else if(lvl>1000000) lvl=1000000;
+
+	if(race==RaceNone);
+	else if(race==RaceGrantar);
+	else if(race==RacePeleng);
+	else if(race==RacePeople);
+	else if(race==RaceTechnol);
+	else if(race==RaceGaal);
+	else race=RaceNone;
+
+	if(machinery<0) machinery=0;
+	else if(machinery>255) machinery=255;
+	if(engineer<0) engineer=0;
+	else if(engineer>255) engineer=255;
+
+	if(oreitem==ItemTypeNone);
+	else if(oreitem==ItemTypeCrystal);
+	else if(oreitem==ItemTypeTitan);
+	else if(oreitem==ItemTypeSilicon);
+	else oreitem=ItemTypeNone;
+
+	if(refuel<-100) refuel=-100;
+	else if(refuel>100) refuel=100;
+
+	if(team<-1) team=-1;
+	else if(team>=(1<<TeamMaxShift)) team=-1;
+
+	bool changetype=(planet->m_Flag & (PlanetFlagSun|PlanetFlagLarge|PlanetFlagWormhole|PlanetFlagGigant|PlanetFlagRich))!=(flag & (PlanetFlagSun|PlanetFlagLarge|PlanetFlagWormhole|PlanetFlagGigant|PlanetFlagRich));
+
+	if(changetype
+		&& (planet->m_Flag & (PlanetFlagSun|PlanetFlagWormhole|PlanetFlagGigant|PlanetFlagLarge|PlanetFlagRich))==(PlanetFlagLarge) 
+		&& (flag & (PlanetFlagSun|PlanetFlagWormhole|PlanetFlagGigant|PlanetFlagLarge|PlanetFlagRich))==(PlanetFlagLarge|PlanetFlagRich)) changetype=false;
+	else if(changetype
+		&& (planet->m_Flag & (PlanetFlagSun|PlanetFlagWormhole|PlanetFlagGigant|PlanetFlagLarge|PlanetFlagRich))==(PlanetFlagLarge|PlanetFlagRich) 
+		&& (flag & (PlanetFlagSun|PlanetFlagWormhole|PlanetFlagGigant|PlanetFlagLarge|PlanetFlagRich))==(PlanetFlagLarge)) changetype=false;
+
+	planet->m_Flag&=~(PlanetFlagSun|PlanetFlagLarge|PlanetFlagWormhole|PlanetFlagGigant|PlanetFlagRich|PlanetFlagArrivalDef|PlanetFlagArrivalAtk|PlanetFlagNoCapture|PlanetFlagNoMove|PlanetFlagHomeworld|PlanetFlagCitadel|PlanetFlagStabilizer);
+	planet->m_Flag|=flag & (PlanetFlagSun|PlanetFlagLarge|PlanetFlagWormhole|PlanetFlagGigant|PlanetFlagRich|PlanetFlagArrivalDef|PlanetFlagArrivalAtk|PlanetFlagNoCapture|PlanetFlagNoMove|PlanetFlagHomeworld|PlanetFlagCitadel|PlanetFlagStabilizer);
+
+	if(planet->m_Flag & (PlanetFlagSun | PlanetFlagWormhole | PlanetFlagGigant)) {
+		lvl=0;
+		owner=0;
+		race=0;
+		machinery=0;
+		engineer=0;
+		oreitem=0;
+		planet->m_Flag&=~(PlanetFlagHomeworld|PlanetFlagCitadel);
+	} else if(planet->m_Flag & PlanetFlagRich) {
+		planet->m_Flag |= PlanetFlagLarge;
+	}
+
+	planet->m_Owner=owner;
+	planet->m_Level=lvl;
+	planet->m_Race=race;
+	planet->m_OreItem=oreitem;
+
+	planet->m_Refuel=refuel;
+	planet->m_Team=team;
+
+	planet->m_FindMask=findid;
+
+	if(timer<=0) planet->m_NeutralCooldown=0;
+	else planet->m_NeutralCooldown=m_CalcTime+timer;
+
+	if(machinery!=0 || engineer!=0 || planet->m_Var) {
+		m_Calc->PlanetVarPrepare(planet);
+		planet->m_Var->m_Machinery=machinery;
+		planet->m_Var->m_Engineer=engineer;
+	}
+
+	if(changetype) {
+		for(i=0;i<PlanetCellCnt;i++) planet->m_Cell[i]=0;
+	}
+
+	planet->m_Sector->m_Ver++;
+	planet->m_Sector->m_VerSlow++;
+
+	return true;
+}
+
+bool CEmpire::PlanetCopy(SPlanet * des,SPlanet * src)
+{
+	int i;
+	des->m_Flag=src->m_Flag;
+	des->m_Owner=src->m_Owner;
+	des->m_Level=src->m_Level;
+	des->m_Race=src->m_Race;
+	des->m_OreItem=src->m_OreItem;
+
+	des->m_Refuel=src->m_Refuel;
+	des->m_Team=src->m_Team;
+
+	des->m_FindMask=src->m_FindMask;
+
+	des->m_NeutralCooldown=src->m_NeutralCooldown;
+
+//	des->m_AutoBuildType=src->m_AutoBuildType;
+//	des->m_AutoBuildCnt=src->m_AutoBuildCnt;
+//	des->m_AutoBuildTime=src->m_AutoBuildTime;
+//	des->m_AutoBuildWait=src->m_AutoBuildWait;
+
+	for(i=0;i<PlanetCellCnt;i++) des->m_Cell[i]=src->m_Cell[i];
+
+	if(src->m_Var) {
+		m_Calc->PlanetVarPrepare(des);
+		des->m_Var->m_Machinery=src->m_Var->m_Machinery;
+		des->m_Var->m_Engineer=src->m_Var->m_Engineer;
+
+		for(i=0;i<PlanetItemCnt;i++) {
+			des->m_Var->m_Item[i].m_Type=src->m_Var->m_Item[i].m_Type;
+            des->m_Var->m_Item[i].m_Cnt=src->m_Var->m_Item[i].m_Cnt;
+            des->m_Var->m_Item[i].m_Owner=src->m_Var->m_Item[i].m_Owner;
+			des->m_Var->m_Item[i].m_Complete=src->m_Var->m_Item[i].m_Complete;
+			des->m_Var->m_Item[i].m_Broken=src->m_Var->m_Item[i].m_Broken;
+			des->m_Var->m_Item[i].m_Flag=src->m_Var->m_Item[i].m_Flag;
+		}
+	} else if(des->m_Var) {
+		des->m_Var->m_Machinery=0;
+		des->m_Var->m_Engineer=0;
+
+		for(i=0;i<PlanetItemCnt;i++) {
+			des->m_Var->m_Item[i].m_Type=0;
+            des->m_Var->m_Item[i].m_Cnt=0;
+            des->m_Var->m_Item[i].m_Owner=0;
+			des->m_Var->m_Item[i].m_Complete=0;
+			des->m_Var->m_Item[i].m_Broken=0;
+			des->m_Var->m_Item[i].m_Flag=0;
+		}
+	}
+
+	des->m_Sector->m_Ver++;
+	des->m_Sector->m_VerSlow++;
+}
+
+bool CEmpire::PlanetDelete(SPlanet * planet)
+{
+	if(!m_PlanetGrow) ERROR_E;
+
+	int i;
+
+	SSector * sec=planet->m_Sector;
+	int planetnum=planet->m_PlanetNum;
+	if(planetnum<0 || planetnum>=sec->m_PlanetCnt) return false;
+
+	PlanetClearRef(this,sec->m_SectorX,sec->m_SectorY,planetnum);
+
+	for(i=planetnum+1;i<sec->m_PlanetCnt;i++) {
+		PlanetMoveMem(sec->m_Planet+i-1,sec->m_Planet+i);
+		PlanetChangeNum(this,sec->m_SectorX,sec->m_SectorY,i-1,i);
+	}
+	sec->m_PlanetCnt--;
+
+	sec->m_Ver++;
+	sec->m_VerSlow++;
+
+	return true;
+}
+
+void CEmpire::ChangeSectorSize(int left,int top,int right,int bottom)
+{
+	if(!m_PlanetGrow) ERROR_E;
+
+	int i,u,x,y,tx,ty,tp,k;
+	SPlanet * planet;
+	SSector * sec;
+
+	Enter("ChangeSectorSize");
+
+	GangClearAll();
+
+	int sminx=m_SectorMinX-left;
+	if(sminx<-200) sminx=-200;
+	else if(sminx>200) sminx=200;
+
+	int sminy=m_SectorMinY-top;
+	if(sminy<-200) sminy=-200;
+	else if(sminy>200) sminy=200;
+
+	int scntx=(m_SectorMinX+m_SectorCntX+right)-sminx;
+	int scnty=(m_SectorMinY+m_SectorCntY+bottom)-sminy;
+	if(scntx<1) scntx=1;
+	else if(scntx>200) scntx=200;
+	if(scnty<1) scnty=1;
+	else if(scnty>200) scnty=200;
+
+//ALogFormat("!!!ChangeSectorSize00 <i>,<i>,<i>,<i>",sminx,sminy,scntx,scnty);
+
+	StatClear();
+
+	SSector * secnew=(SSector *)HAllocClear(scntx*scnty*sizeof(SSector),m_Heap);
+	SPlanet * planetnew=(SPlanet *)HAllocClear(scntx*scnty*PlanetOnSectorMaxSys*sizeof(SPlanet),m_Heap);
+	int planetnewcnt=0;
+
+	planet=planetnew;
+	k=scntx*scnty*PlanetOnSectorMaxSys;
+	for(i=0;i<k;i++,planet++) {
+		planet->m_Team=-1;
+	}
+
+	sec=secnew;
+	for(y=0;y<scnty;y++) {
+		for(x=0;x<scntx;x++,sec++) {
+			sec->m_Planet=planetnew+planetnewcnt;
+			planetnewcnt+=PlanetOnSectorMaxSys;
+		}
+	}
+	if(planetnewcnt!=scntx*scnty*PlanetOnSectorMaxSys) ERROR_E;
+
+	sec=m_Sector;
+	for(y=m_SectorMinY;y<m_SectorMinY+m_SectorCntY;y++) {
+		for(x=m_SectorMinX;x<m_SectorMinX+m_SectorCntX;x++,sec++) {
+			if(x<sminx || x>=sminx+scntx) continue;
+			if(y<sminy || y>=sminy+scnty) continue;
+			SSector * dsec=secnew+((x-sminx)+(y-sminy)*scntx);
+
+			SPlanet * pp=dsec->m_Planet;
+			MemCopy(dsec,sec,sizeof(SSector));
+			dsec->m_Planet=pp;
+		}
+	}
+
+	sec=m_Sector;
+	for(y=m_SectorMinY;y<m_SectorMinY+m_SectorCntY;y++) {
+		for(x=m_SectorMinX;x<m_SectorMinX+m_SectorCntX;x++,sec++) {
+			if(x<sminx || x>=sminx+scntx) continue;
+			if(y<sminy || y>=sminy+scnty) continue;
+			SSector * dsec=secnew+((x-sminx)+(y-sminy)*scntx);
+
+			SPlanet * pp=dsec->m_Planet;
+			dsec->m_Planet=pp;
+			planet=dsec->m_Planet;
+
+			for(i=0;i<dsec->m_PlanetCnt;i++,planet++) {
+				MemCopy(planet,sec->m_Planet+i,sizeof(SPlanet));
+
+				while(planet->m_Path) {
+					int fsx=max(m_SectorMinX,x-2);
+					int fsy=max(m_SectorMinY,y-2);
+					int esx=min(m_SectorMinX+m_SectorCntX,x+3);
+					int esy=min(m_SectorMinY+m_SectorCntY,y+3);
+
+		            CalcFromPlanetOffset(x,y,planet->m_Path,&tx,&ty,&tp);
+        		    if(tx<fsx || tx>=esx || ty<fsy || ty>=esy) { planet->m_Path=0; break; }
+					if(tx<sminx || tx>=sminx+scntx) { planet->m_Path=0; break; }
+					if(ty<sminy || ty>=sminy+scnty) { planet->m_Path=0; break; }
+
+					SSector * dsec2=secnew+((tx-sminx)+(ty-sminy)*scntx);
+					if(tp<0 || tp>=dsec2->m_PlanetCnt) { planet->m_Path=0; break; }
+
+					break;
+				}
+				for(k=0;k<RouteMax;k++) {
+					while(planet->m_RouteList[k]) {
+						int fsx=max(m_SectorMinX,x-1);
+						int fsy=max(m_SectorMinY,y-1);
+						int esx=min(m_SectorMinX+m_SectorCntX,x+2);
+						int esy=min(m_SectorMinY+m_SectorCntY,y+2);
+
+		            	CalcFromPlanetOffset(x,y,planet->m_RouteList[k],&tx,&ty,&tp);
+	        		    if(tx<fsx || tx>=esx || ty<fsy || ty>=esy) { planet->m_RouteList[k]=0; break; }
+						if(tx<sminx || tx>=sminx+scntx) { planet->m_RouteList[k]=0; break; }
+						if(ty<sminy || ty>=sminy+scnty) { planet->m_RouteList[k]=0; break; }
+
+						SSector * dsec2=secnew+((tx-sminx)+(ty-sminy)*scntx);
+						if(tp<0 || tp>=dsec2->m_PlanetCnt) { planet->m_RouteList[k]=0; break; }
+
+						break;
+					}
+				}
+
+				if(planet->m_PortalSectorX<sminx || planet->m_PortalSectorX>=sminx+scntx || planet->m_PortalSectorY<sminy || planet->m_PortalSectorY>=sminy+scnty) {
+					planet->m_PortalPlanet=0;
+					planet->m_PortalSectorX=0;
+					planet->m_PortalSectorY=0;
+					planet->m_PortalCnt=0;
+					planet->m_PortalOwner=0;
+					planet->m_PortalCotlId=0;
+					planet->m_PortalOwner=0;
+				}
+
+				SShip * ship=planet->m_Ship;
+				for(u=0;u<ShipOnPlanetMax;u++,ship++) {
+					if(ship->m_Type==ShipTypeNone) continue;
+
+					if(ship->m_FromSectorX<sminx || ship->m_FromSectorX>=sminx+scntx || ship->m_FromSectorY<sminy || ship->m_FromSectorY>=sminy+scnty) {
+						ship->m_FromSectorX=x;
+						ship->m_FromSectorY=y;
+						ship->m_FromPlanet=i;
+						ship->m_FromPlace=u;
+						ship->m_Flag&=~(/*@ShipFlagAutoReturn|*/ShipFlagAINeedReturn);
+					}
+					while(ship->m_PathMove) {
+						if(ship->m_PathMove->m_SectorX<sminx || ship->m_PathMove->m_SectorX>=sminx+scntx || ship->m_PathMove->m_SectorY<sminy || ship->m_PathMove->m_SectorY>=sminy+scnty) {
+							PathMoveClearInner(ship,false);
+							break;
+						}
+
+						if(!(ship->m_PathMove->m_SectorX==x && ship->m_PathMove->m_SectorY==y && ship->m_PathMove->m_PlanetNum==i)) {
+							PathMoveClearInner(ship,false);
+							break;
+						} else if(ship->m_PathMove->m_Cur>=ship->m_PathMove->m_Cnt) {
+	        			    PathMoveClearInner(ship,false);
+							break;
+						}
+
+						int csx=x;
+						int csy=y;
+						int cpn=i;
+						int k=ship->m_PathMove->m_Cur;
+						int nx,ny,np;
+
+						for(;k<ship->m_PathMove->m_Cnt;k++) {
+							CalcFromPlanetOffset(csx,csy,ship->m_PathMove->m_Path[k],&nx,&ny,&np);
+							if(nx<sminx || nx>=sminx+scntx || ny<sminy || ny>=sminy+scnty) {
+								break;
+							}
+							csx=nx;
+							csy=ny;
+							cpn=np;
+						}
+						if(k<ship->m_PathMove->m_Cnt) {
+							PathMoveClearInner(ship);
+							break;
+						}
+
+						break;
+					}
+					while(ship->m_Link) {
+						int fsx=max(m_SectorMinX,x-1);
+						int fsy=max(m_SectorMinY,y-1);
+						int esx=min(m_SectorMinX+m_SectorCntX,x+2);
+						int esy=min(m_SectorMinY+m_SectorCntY,y+2);
+
+		        	    LinkExtract(ship,&tx,&ty,&tp);
+        		    	if(tx<fsx || tx>=esx || ty<fsy || ty>=esy) {
+							ship->m_Link=0;
+							break;
+						}
+						if(tx<sminx || tx>=sminx+scntx) { ship->m_Link=0; break; }
+						if(ty<sminy || ty>=sminy+scnty) { ship->m_Link=0; break; }
+
+						SSector * dsec2=secnew+((tx-sminx)+(ty-sminy)*scntx);
+						if(tp<0 || tp>=dsec2->m_PlanetCnt) { ship->m_Link=0; break; }
+
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	HFree(m_Sector,m_Heap);
+	HFree(m_Planet,m_Heap);
+	m_Sector=secnew;
+	m_Planet=planetnew;
+	m_PlanetCnt=planetnewcnt;
+	m_SectorMinX=sminx;
+	m_SectorMinY=sminy;
+	m_SectorCntX=scntx;
+	m_SectorCntY=scnty;
+	InitPtr();
+
+	m_WorldVer++;
+	m_StateVer++;
+
+	Leave();
+}
+
+void CEmpire::CreateSector(int cntx,int cnty,int planetcnt)
+{
+	GangClearAll();
+
+	m_SectorCntX=cntx;
+	m_SectorCntY=cnty;
+	int cnt=m_SectorCntX*m_SectorCntY;
+	m_Sector=(SSector *)HAllocClear(cnt*sizeof(SSector),m_Heap);
+
+	m_PlanetCnt=planetcnt;
+	m_Planet=(SPlanet *)HAllocClear(planetcnt*sizeof(SPlanet),m_Heap);
+	m_PlanetGrow=(planetcnt>=cnt*PlanetOnSectorMaxSys);
+
+	int i;
+	SPlanet * planet=m_Planet;
+	for(i=0;i<planetcnt;i++,planet++) {
+		planet->m_Team=-1;
+	}
+}
+
+void CEmpire::InitPtr()
+{
+	int x,y,i,u;
+
+	SSector * sec=m_Sector;
+	for(y=0;y<m_SectorCntY;y++) {
+		for(x=0;x<m_SectorCntX;x++,sec++) {
+			sec->m_SectorX=x+m_SectorMinX;
+			sec->m_SectorY=y+m_SectorMinY;
+
+			SPlanet * planet=sec->m_Planet;
+			for(i=0;i<IF(m_PlanetGrow,PlanetOnSectorMaxSys,sec->m_PlanetCnt);i++,planet++) {
+				planet->m_Sector=sec;
+				planet->m_PlanetNum=i;
+
+				SShip * ship=planet->m_Ship;
+				for(u=0;u<ShipOnPlanetMax;u++,ship++) {
+					ship->m_Planet=planet;
+					ship->m_ShipNum=u;
+				}
+			}
+		}
+	}
+}
+
+void CEmpire::CreateHole(int * el,int elcnt,int loopcnt)
+{
+	int i,x,y,sx,sy,h,swap;
+	SSector * sec;
+
+	if(elcnt<1) ERROR_E;
+	int bx=el[0];
+	int by=el[1];
+	int ex=bx+1;
+	int ey=by+1;
+
+	int mulx=1;
+	if(m_Rnd.Rnd(0,100)<50) mulx=-1;
+	int muly=1;
+	if(m_Rnd.Rnd(0,100)<50) muly=-1;
+	bool swapxy=false;
+	if(m_Rnd.Rnd(0,100)<50) swapxy=true;
+
+	for(i=0;i<elcnt;i++) {
+		x=el[(i<<1)+0]; if(mulx<0) x=-x;
+		y=el[(i<<1)+1]; if(muly<0) y=-y;
+		if(swapxy) { swap=x; x=y; y=swap; }
+		bx=min(bx,x);
+		by=min(by,y);
+		ex=max(ex,x+1);
+		ey=max(ey,y+1);
+	}
+
+	for(h=0;h<loopcnt;h++) {
+		sx=m_Rnd.Rnd(m_SectorMinX-bx,m_SectorMinX+m_SectorCntX-ex);
+		sy=m_Rnd.Rnd(m_SectorMinY-by,m_SectorMinY+m_SectorCntY-ey);
+//ALogFormat("    Sxy=<i>,<i> Cxy=<i>,<i> Bxy=<i>,<i> Exy=<i>,<i>",sx,sy,m_SectorCntX,m_SectorCntY,bx,by,ex,ey);
+
+		for(i=0;i<elcnt;i++) {
+			x=el[(i<<1)+0]; if(mulx<0) x=-x;
+			y=el[(i<<1)+1]; if(muly<0) y=-y;
+			if(swapxy) { swap=x; x=y; y=swap; }
+			x+=sx;
+			y+=sy;
+			if(x<m_SectorMinX || x>=m_SectorMinX+m_SectorCntX) break;//ERROR_E;
+			if(y<m_SectorMinY || y>=m_SectorMinY+m_SectorCntY) break;//ERROR_E;
+
+			sec=m_Sector+((x-m_SectorMinX)+(y-m_SectorMinY)*m_SectorCntX);
+			if(sec->m_InflOwner) break;
+
+			if(x>m_SectorMinX && sec[-1].m_PlanetCnt<0) break;
+			if(x<(m_SectorMinX+m_SectorCntX-1) && sec[+1].m_PlanetCnt<0) break;
+			if(y>m_SectorMinY && sec[-m_SectorCntX].m_PlanetCnt<0) break;
+			if(y<(m_SectorMinY+m_SectorCntY-1) && sec[+m_SectorCntX].m_PlanetCnt<0) break;
+		}
+		if(i<elcnt) continue;
+
+		for(i=0;i<elcnt;i++) {
+			x=el[(i<<1)+0]; if(mulx<0) x=-x;
+			y=el[(i<<1)+1]; if(muly<0) y=-y;
+			if(swapxy) { swap=x; x=y; y=swap; }
+			x+=sx;
+			y+=sy;
+
+			sec=m_Sector+((x-m_SectorMinX)+(y-m_SectorMinY)*m_SectorCntX);
+
+			sec->m_PlanetCnt=-1;
+		}
+		break;
+	}
+}
+
+void CEmpire::CreateHoleSpecial(int * el,int elcnt,int loopcnt,int ignorecenter)
+{
+	int i,x,y,sx,sy,h,swap;
+	SSector * sec;
+
+	if(elcnt<1) ERROR_E;
+	int bx=el[0];
+	int by=el[1];
+	int ex=bx+1;
+	int ey=by+1;
+
+	int mulx=1;
+	if(m_Rnd.Rnd(0,100)<50) mulx=-1;
+	int muly=1;
+	if(m_Rnd.Rnd(0,100)<50) muly=-1;
+	bool swapxy=false;
+	if(m_Rnd.Rnd(0,100)<50) swapxy=true;
+
+	for(i=0;i<elcnt;i++) {
+		x=el[(i<<1)+0]; if(mulx<0) x=-x;
+		y=el[(i<<1)+1]; if(muly<0) y=-y;
+		if(swapxy) { swap=x; x=y; y=swap; }
+		bx=min(bx,x);
+		by=min(by,y);
+		ex=max(ex,x+1);
+		ey=max(ey,y+1);
+	}
+
+	for(h=0;h<loopcnt;h++) {
+		sx=m_Rnd.Rnd(m_SectorMinX-bx-((ex-bx)>>1)-((ex-bx)>>2),m_SectorMinX+m_SectorCntX-ex+((ex-bx)>>1)+((ex-bx)>>2));
+		sy=m_Rnd.Rnd(m_SectorMinY-by-((ey-by)>>1)-((ey-by)>>2),m_SectorMinY+m_SectorCntY-ey+((ey-by)>>1)+((ey-by)>>2));
+//ALogFormat("    Sxy=<i>,<i> Cxy=<i>,<i> Bxy=<i>,<i> Exy=<i>,<i>",sx,sy,m_SectorCntX,m_SectorCntY,bx,by,ex,ey);
+
+		if(ignorecenter>0) {
+			int dcx=sx+((ex-bx)>>1)-(m_SectorMinX+(m_SectorCntX>>1));
+			int dcy=sy+((ey-by)>>1)-(m_SectorMinY+(m_SectorCntY>>1));
+			if((dcx*dcx+dcy*dcy)<ignorecenter*ignorecenter) { h--; continue; }
+		}
+
+		for(i=0;i<elcnt;i++) {
+			x=el[(i<<1)+0]; if(mulx<0) x=-x;
+			y=el[(i<<1)+1]; if(muly<0) y=-y;
+			if(swapxy) { swap=x; x=y; y=swap; }
+			x+=sx;
+			y+=sy;
+			if(x<m_SectorMinX || x>=m_SectorMinX+m_SectorCntX) continue;
+			if(y<m_SectorMinY || y>=m_SectorMinY+m_SectorCntY) continue;
+
+			sec=m_Sector+((x-m_SectorMinX)+(y-m_SectorMinY)*m_SectorCntX);
+			if(sec->m_InflOwner) break;
+
+			if(ignorecenter) continue;
+
+			if(x>m_SectorMinX && sec[-1].m_PlanetCnt<0) break;
+			if(x<(m_SectorMinX+m_SectorCntX-1) && sec[+1].m_PlanetCnt<0) break;
+			if(y>m_SectorMinY && sec[-m_SectorCntX].m_PlanetCnt<0) break;
+			if(y<(m_SectorMinY+m_SectorCntY-1) && sec[+m_SectorCntX].m_PlanetCnt<0) break;
+		}
+		if(i<elcnt) continue;
+
+		for(i=0;i<elcnt;i++) {
+			x=el[(i<<1)+0]; if(mulx<0) x=-x;
+			y=el[(i<<1)+1]; if(muly<0) y=-y;
+			if(swapxy) { swap=x; x=y; y=swap; }
+			x+=sx;
+			y+=sy;
+
+			if(x<m_SectorMinX || x>=m_SectorMinX+m_SectorCntX) continue;
+			if(y<m_SectorMinY || y>=m_SectorMinY+m_SectorCntY) continue;
+			sec=m_Sector+((x-m_SectorMinX)+(y-m_SectorMinY)*m_SectorCntX);
+
+			sec->m_PlanetCnt=-1;
+		}
+		break;
+	}
+}
+
+void CEmpire::CreateHoleXY(int * el,int elcnt,int sx,int sy)
+{
+	int i,x,y,h,swap;
+	SSector * sec;
+
+	if(elcnt<1) ERROR_E;
+	int bx=el[0];
+	int by=el[1];
+	int ex=bx+1;
+	int ey=by+1;
+
+	int mulx=1;
+	if(m_Rnd.Rnd(0,100)<50) mulx=-1;
+	int muly=1;
+	if(m_Rnd.Rnd(0,100)<50) muly=-1;
+	bool swapxy=false;
+	if(m_Rnd.Rnd(0,100)<50) swapxy=true;
+
+	for(i=0;i<elcnt;i++) {
+		x=el[(i<<1)+0]; if(mulx<0) x=-x;
+		y=el[(i<<1)+1]; if(muly<0) y=-y;
+		if(swapxy) { swap=x; x=y; y=swap; }
+		bx=min(bx,x);
+		by=min(by,y);
+		ex=max(ex,x+1);
+		ey=max(ey,y+1);
+	}
+
+	sx-=(ex+bx)>>1;
+	sy-=(ey+by)>>1;
+
+	for(i=0;i<elcnt;i++) {
+		x=el[(i<<1)+0]; if(mulx<0) x=-x;
+		y=el[(i<<1)+1]; if(muly<0) y=-y;
+		if(swapxy) { swap=x; x=y; y=swap; }
+		x+=sx;
+		y+=sy;
+
+		if(x<m_SectorMinX || x>=m_SectorMinX+m_SectorCntX) continue;
+		if(y<m_SectorMinY || y>=m_SectorMinY+m_SectorCntY) continue;
+		sec=m_Sector+((x-m_SectorMinX)+(y-m_SectorMinY)*m_SectorCntX);
+
+		sec->m_PlanetCnt=-1;
+	}
+}
+
+int CreateHoleTempl(int * el,const char * str)
+{
+	int cnt=0;
+	int x=0;
+	int y=0;
+	while(true) {
+		char ch=*str;
+		str++;
+		if(ch==0) break;
+		if(ch=='\n') { y++; x=0; continue; }
+
+		if(ch!=' ') {
+			el[0]=x;
+			el[1]=y;
+//ALogFormat("    CreateHoleTempl <i> <i>",x,y);
+			el+=2;
+			cnt++;
+		}
+
+		x++;
+	}
+	return cnt;
+}
+
+void CEmpire::FillCircleSpecial(int x,int y,int r,int v)
+{
+	r*=r;
+	int fsx=max(m_SectorMinX,x-r);
+	int fsy=max(m_SectorMinY,y-r);
+	int esx=min(m_SectorMinX+m_SectorCntX,x+r+1);
+	int esy=min(m_SectorMinY+m_SectorCntY,y+r+1);
+
+	SSector * cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+	for(int sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+		for(int sx=fsx;sx<esx;sx++,cursec++) {
+			int rr=(sx-x)*(sx-x)+(sy-y)*(sy-y);
+			if(rr>r) continue;
+			cursec->m_PlanetCnt=v;
+		}
+	}
+}
+
+void CEmpire::FillLineSpecial(int x1,int y1,int x2,int y2,int r1,int r2,int v)
+{
+	int dx=abs(x2-x1);
+	int dy=abs(y2-y1);
+	int sx=x2>=x1?1:-1;
+	int sy=y2>=y1?1:-1;
+	int x=x1;
+	int y=y1;
+
+	if(dy<=dx) {
+		int d=(dy<<1) - dx;
+		int d1=dy<<1;
+		int d2=(dy-dx)<<1;
+		FillCircleSpecial(x,y,r1,v);
+
+		x+=sx;
+		for(int i=1;i<=dx; i++, x+=sx) {
+			if(d>0) { d+=d2; y+=sy; }
+			else d+=d1;
+			int r=int(r1+double(r2-r1)*double(x-x1)/double(x2-x1));
+			FillCircleSpecial(x,y,r,v);
+		}
+	} else {
+		int d=(dx<<1) - dy;
+		int d1=dx<<1;
+		int d2=(dx-dy)<<1;
+
+		y+=sy;
+		for(int i=1;i<=dy; i++, y+=sy) {
+			if(d>0) { d+=d2; x+=sx; }
+			else d+=d1;
+			int r=int(r1+double(r2-r1)*double(y-y1)/double(y2-y1));
+			FillCircleSpecial(x,y,r,v);
+		}
+	}
+}
+
+int CEmpire::CalcCntBound()
+{
+	int fsx=m_SectorMinX+1;
+	int fsy=m_SectorMinY+1;
+	int esx=m_SectorMinX+m_SectorCntX-1;
+	int esy=m_SectorMinY+m_SectorCntY-1;
+
+	int bc=0;
+
+	SSector * cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+	for(int sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+		for(int sx=fsx;sx<esx;sx++,cursec++) {
+			if(cursec->m_PlanetCnt!=(cursec-1)->m_PlanetCnt) bc++;
+			else if(cursec->m_PlanetCnt!=(cursec+1)->m_PlanetCnt) bc++;
+			else if(cursec->m_PlanetCnt!=(cursec-m_SectorCntX)->m_PlanetCnt) bc++;
+			else if(cursec->m_PlanetCnt!=(cursec+m_SectorCntX)->m_PlanetCnt) bc++;
+		}
+	}
+	return bc;
+}
+
+bool CEmpire::AddGate2(int x,int y,int island1, int island2)
+{
+	if(x-1<m_SectorMinX) return false;
+	if(x+1>=m_SectorMinX+m_SectorCntX) return false;
+	if(y-1<m_SectorMinY) return false;
+	if(y+1>=m_SectorMinY+m_SectorCntY) return false;
+
+	SSector * sec=GetSector(x,y);
+	sec->m_PlanetCnt=-3;
+	SSector * s;
+
+	if(m_Rnd.Rnd(0,99)<50) {
+		s=sec-1-m_SectorCntX; s->m_PlanetCnt=-2; s->m_Infl=island1;
+		s=sec+0-m_SectorCntX; s->m_PlanetCnt=-2; s->m_Infl=island1;
+		s=sec+1-m_SectorCntX; s->m_PlanetCnt=-2; s->m_Infl=island1;
+
+		s=sec-1+m_SectorCntX; s->m_PlanetCnt=-2; s->m_Infl=island2;
+		s=sec+0+m_SectorCntX; s->m_PlanetCnt=-2; s->m_Infl=island2;
+		s=sec+1+m_SectorCntX; s->m_PlanetCnt=-2; s->m_Infl=island2;
+	} else {
+		s=sec-m_SectorCntX-1; s->m_PlanetCnt=-2; s->m_Infl=island1;
+		s=sec+0-1; s->m_PlanetCnt=-2; s->m_Infl=island1;
+		s=sec+m_SectorCntX-1; s->m_PlanetCnt=-2; s->m_Infl=island1;
+
+		s=sec-m_SectorCntX+1; s->m_PlanetCnt=-2; s->m_Infl=island2;
+		s=sec+0+1; s->m_PlanetCnt=-2; s->m_Infl=island2;
+		s=sec+m_SectorCntX+1; s->m_PlanetCnt=-2; s->m_Infl=island2;
+	}
+	return true;
+}
+
+CEmpire::SSector * CEmpire::FindGate(int x,int y,int r)
+{
+	int fsx=max(m_SectorMinX,x-r);
+	int fsy=max(m_SectorMinY,y-r);
+	int esx=min(m_SectorMinX+m_SectorCntX,x+r+1);
+	int esy=min(m_SectorMinY+m_SectorCntY,y+r+1);
+
+	SSector * cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+	for(int sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+		for(int sx=fsx;sx<esx;sx++,cursec++) {
+			if(cursec->m_PlanetCnt!=-3) continue;
+			if(((x-sx)*(x-sx)+(y-sy)*(y-sy))>(r*r)) continue;
+			return cursec;
+		}
+	}
+	return false;
+}
+
+CEmpire::SSector * CEmpire::FindBorder(int x,int y,int r)
+{
+	int fsx=max(m_SectorMinX,x-r);
+	int fsy=max(m_SectorMinY,y-r);
+	int esx=min(m_SectorMinX+m_SectorCntX,x+r+1);
+	int esy=min(m_SectorMinY+m_SectorCntY,y+r+1);
+
+	SSector * cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+	for(int sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+		for(int sx=fsx;sx<esx;sx++,cursec++) {
+			if(cursec->m_PlanetCnt!=-1) continue;
+			if(((x-sx)*(x-sx)+(y-sy)*(y-sy))>(r*r)) continue;
+			return cursec;
+		}
+	}
+	return false;
+}
+
+void CEmpire::GrowGateIsland(int cntlvl)
+{
+	int cnt,sx,sy,y,k;
+	SSector * sec;
+	SSector * s;
+
+	SSector * * seclist=(SSector * *)HAlloc(m_SectorCntX*m_SectorCntY*sizeof(SSector *),m_Heap);
+	int seccnt=0;
+
+	int lvl=1;
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(y=0;y<cnt;y++,sec++) {
+		if(sec->m_PlanetCnt!=-2) {
+			sec->m_InflOwner=0;
+			continue;
+		}
+		seclist[seccnt]=sec;
+		seccnt++;
+		sec->m_InflOwner=lvl;
+	}
+
+	lvl++;
+
+	int sme=0;
+	int nextlvl=seccnt;
+	while(sme<seccnt) {
+		sec=seclist[sme];
+		sme++;
+
+		for(k=0;k<4;k++) {
+			if(k==0) {
+				if(sec->m_SectorX-1<m_SectorMinX) continue;
+				s=sec-1;
+			} else if(k==1) {
+				if(sec->m_SectorX+1>=m_SectorMinX+m_SectorCntX) continue;
+				s=sec+1;
+			} else if(k==2) {
+				if(sec->m_SectorY-1<m_SectorMinY) continue;
+				s=sec-m_SectorCntX;
+			} else {
+				if(sec->m_SectorY+1>=m_SectorMinY+m_SectorCntY) continue;
+				s=sec+m_SectorCntX;
+			}
+			if(s->m_PlanetCnt!=0) continue;
+
+			int fsx=max(m_SectorMinX,s->m_SectorX-1);
+			int fsy=max(m_SectorMinY,s->m_SectorY-1);
+			int esx=min(m_SectorMinX+m_SectorCntX,s->m_SectorX+2);
+			int esy=min(m_SectorMinY+m_SectorCntY,s->m_SectorY+2);
+
+			SSector * cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+			for(sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+				for(sx=fsx;sx<esx;sx++,cursec++) {
+					if(cursec==s) continue;
+
+					if(cursec->m_PlanetCnt==0);
+					else if(cursec->m_PlanetCnt==-2 && cursec->m_Infl==sec->m_Infl);
+					else break;
+				}
+				if(sx<esx) break;
+			}
+			if(sy<esy) continue;
+
+			s->m_PlanetCnt=-2;
+			s->m_Infl=sec->m_Infl;
+			s->m_InflOwner=lvl;
+
+			seclist[seccnt]=s;
+			seccnt++;
+			if(seccnt>=m_SectorCntX*m_SectorCntY) ERROR_E;
+		}
+
+		if(sme>=nextlvl) {
+			lvl++;
+			nextlvl=seccnt;
+			if(lvl>cntlvl) break;
+		}
+	}
+
+	HFree(seclist,m_Heap);
+}
+
+int CEmpire::CalcGateIslandDist(int fromisland,int toisland)
+{
+	int cnt,sx,sy,y,k;
+	SSector * sec;
+
+	SSector * * seclist=(SSector * *)HAlloc(m_SectorCntX*m_SectorCntY*sizeof(SSector *),m_Heap);
+	int seccnt=0;
+
+	int lvl=1;
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(y=0;y<cnt;y++,sec++) {
+		if((sec->m_PlanetCnt!=-2 && sec->m_PlanetCnt!=-3) || sec->m_Infl!=fromisland) {
+			sec->m_InflOwner=0;
+			continue;
+		}
+		seclist[seccnt]=sec;
+		seccnt++;
+		sec->m_InflOwner=lvl;
+	}
+
+	lvl++;
+
+	int sme=0;
+	int nextlvl=seccnt;
+	while(sme<seccnt) {
+		sec=seclist[sme];
+		sme++;
+
+		int fsx=max(m_SectorMinX,sec->m_SectorX-1);
+		int fsy=max(m_SectorMinY,sec->m_SectorY-1);
+		int esx=min(m_SectorMinX+m_SectorCntX,sec->m_SectorX+2);
+		int esy=min(m_SectorMinY+m_SectorCntY,sec->m_SectorY+2);
+
+		SSector * cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+		for(sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+			for(sx=fsx;sx<esx;sx++,cursec++) {
+				if(cursec==sec) continue;
+				if(cursec->m_InflOwner) continue;
+				if(cursec->m_PlanetCnt>=0) continue;
+
+				if(cursec->m_PlanetCnt==-2 && cursec->m_Infl==toisland) { HFree(seclist,m_Heap); return lvl; }
+
+				cursec->m_InflOwner=lvl;
+				seclist[seccnt]=cursec;
+				seccnt++;
+				if(seccnt>=m_SectorCntX*m_SectorCntY) ERROR_E;
+			}
+		}
+
+		if(sme>=nextlvl) {
+			lvl++;
+			nextlvl=seccnt;
+		}
+	}
+
+	HFree(seclist,m_Heap);
+
+	return 1000000;
+}
+
+void CEmpire::CalcGateIslandSize(int * islandsize,int maxislandcnt)
+{
+	int i,cnt;
+	SSector * sec;
+
+	MemZero(islandsize,maxislandcnt*sizeof(int));
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		if(sec->m_PlanetCnt!=-2) continue;
+		if(sec->m_Infl>=maxislandcnt) continue;
+		islandsize[sec->m_Infl]++;
+	}
+}
+
+int CEmpire::CalcGateIslandBorder(int island,int * islandborder,int bufmaxcnt)
+{
+	int i,cnt,k,sy,sx,u;
+	SSector * sec, * s,* cursec;
+
+	int bordercnt=0;
+	MemZero(islandborder,bufmaxcnt*sizeof(int));
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		if(sec->m_PlanetCnt!=-2) continue;
+		if(sec->m_Infl!=island) continue;
+
+		for(k=0;k<4;k++) {
+			if(k==0) {
+				if(sec->m_SectorX-1<m_SectorMinX) continue;
+				s=sec-1;
+			} else if(k==1) {
+				if(sec->m_SectorX+1>=m_SectorMinX+m_SectorCntX) continue;
+				s=sec+1;
+			} else if(k==2) {
+				if(sec->m_SectorY-1<m_SectorMinY) continue;
+				s=sec-m_SectorCntX;
+			} else {
+				if(sec->m_SectorY+1>=m_SectorMinY+m_SectorCntY) continue;
+				s=sec+m_SectorCntX;
+			}
+			if(s->m_PlanetCnt!=0) continue;
+
+			int fsx=max(m_SectorMinX,s->m_SectorX-1);
+			int fsy=max(m_SectorMinY,s->m_SectorY-1);
+			int esx=min(m_SectorMinX+m_SectorCntX,s->m_SectorX+2);
+			int esy=min(m_SectorMinY+m_SectorCntY,s->m_SectorY+2);
+
+			cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+			for(sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+				for(sx=fsx;sx<esx;sx++,cursec++) {
+					if(cursec==s) continue;
+
+					if(cursec->m_PlanetCnt==-2);
+					else if(cursec->m_PlanetCnt==0);
+					else break;
+				}
+				if(sx<esx) break;
+			}
+			if(sy<esy) continue;
+
+			cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+			for(sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+				for(sx=fsx;sx<esx;sx++,cursec++) {
+					if(cursec==s) continue;
+
+					if(cursec->m_PlanetCnt==-2);
+					else if(cursec->m_PlanetCnt==0) continue;
+					else break;
+
+					if(cursec->m_Infl==sec->m_Infl) continue;
+
+					for(u=0;u<bordercnt;u++) {
+						if(islandborder[(u<<1)+0]==cursec->m_Infl) break;
+					}
+					if(u<bordercnt) {
+						islandborder[(u<<1)+1]++;
+					} else {
+						if(((bordercnt<<1)+1)>=bufmaxcnt) ERROR_E;
+						islandborder[(bordercnt<<1)+0]=cursec->m_Infl;
+						islandborder[(bordercnt<<1)+1]=1;
+						bordercnt++;
+					}
+				}
+				if(sx<esx) break;
+			}
+			if(sy<esy) continue;
+
+		}
+	}
+	return bordercnt;
+}
+
+void CEmpire::ChangeGateIsland(int oldisland,int newisland)
+{
+	int i,cnt;
+	SSector * sec;
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		if(sec->m_PlanetCnt!=-2) continue;
+		if(sec->m_Infl!=oldisland) continue;
+		sec->m_Infl=newisland;
+	}
+}
+
+bool CEmpire::FillPlanet()
+{
+	int i,u,t,x,y,px,py,tx,ty,cnt,k;
+	SSector * sec;
+	SPlanet * planet;
+
+//ALogFormat("!!!FP00");
+	if(m_CotlType==SEmpireCotl::TypeUser) {
+		// Создаем внешние границы
+		while(true) {
+			cnt=m_SectorCntX*m_SectorCntY;
+			sec=m_Sector;
+			for(i=0;i<cnt;i++,sec++) {
+				sec->m_Infl=0;
+				sec->m_InflOwner=0;
+				sec->m_PlanetCnt=-1;
+			}
+//			FillCircleSpecial(0,0,m_SectorCntX/2-1,0);
+
+			int linecnt=(m_SectorCntX+m_SectorCntY)/8;
+			if(linecnt<=0) linecnt=1;
+			int linesize=5;
+
+			int inr=max(m_SectorCntX,m_SectorCntY)/2;
+
+/*			for(i=0;i<linecnt;i++) {
+				int x1=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y1=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				int x2=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y2=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				int r=(x2-x1)*(x2-x1)+(y2-y1)*(y2-y1);
+				int d=max(m_SectorCntX,m_SectorCntY);
+				d=(d>>1)+(d>>2);
+
+				//if(i==0) d=d+(d>>3);
+				//else
+				if(i==1);
+				else d=(d>>1)+(d>>2);
+
+				if(r<d*d) { i--; continue; }
+
+				FillLineSpecial(x1,y1,x2,y2,4,6,0);
+			}*/
+
+//ALogFormat("!!!FP00.00");
+			for(i=0;i<linecnt;i++) {
+				int x1=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y1=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				if((x1*x1+y1*y1)>inr*inr) continue;
+
+				int x2=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y2=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				if((x2*x2+y2*y2)>inr*inr) continue;
+
+				int r=(x2-x1)*(x2-x1)+(y2-y1)*(y2-y1);
+				int d=inr>>2;
+
+				/*if(i==0) d=d+(d>>3);
+				else*/ if(i==0);
+				else d=(d>>1)+(d>>2);
+
+				if(r<d*d) { i--; continue; }
+
+				FillLineSpecial(x1,y1,x2,y2,m_Rnd.Rnd(3,5),m_Rnd.Rnd(3,5),0);
+//ALogFormat("!!!FLS<i> <i>,<i>,<i>,<i>",i,x1,y1,x2,y2);
+			}
+
+//ALogFormat("!!!FP00.01");
+			int cggg=0;
+			for(i=0;i<linecnt;i++) {
+				cggg++;
+				if(cggg>=10000) break;
+				int x1=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y1=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				int x2=x1+m_Rnd.Rnd(-20,20);
+				int y2=y1+m_Rnd.Rnd(-20,20);
+				int r=(x2-x1)*(x2-x1)+(y2-y1)*(y2-y1);
+
+				if(r<3*3) { i--; continue; }
+				if(r>5*5) { i--; continue; }
+
+				sec=GetSector(x1,y1);
+				if(sec==NULL) { i--; continue; }
+				if(sec->m_PlanetCnt!=-1) { i--; continue; }
+
+				sec=GetSector(x2,y2);
+				if(sec==NULL) { i--; continue; }
+				if(sec->m_PlanetCnt!=0) { i--; continue; }
+
+				FillLineSpecial(x1,y1,x2,y2,m_Rnd.Rnd(2,4),m_Rnd.Rnd(2,4),0);
+//ALogFormat("!!!FLS<i> <i>,<i>,<i>,<i>",i,x1,y1,x2,y2);
+			}
+			if(cggg>=10000) continue;
+//ALogFormat("!!!FP00.02 <i>",cggg);
+
+			int cntb=CalcCntBound();
+//ALogFormat("!!!CntBound <i>",cntb);
+//			if(cntb<((m_SectorCntX*m_SectorCntY)/7)) continue;
+			if(cntb<260) continue;
+
+			break;
+		}
+//ALogFormat("!!!FP01");
+
+		//
+		int island=1;
+
+		cnt=m_SectorCntX*m_SectorCntY;
+		int islandignoresize=cnt;
+		byte * islandignore=(byte *)HAllocClear(islandignoresize*islandignoresize,m_Heap);
+
+		for(i=0;i<cnt;i++) {
+			x=m_Rnd.Rnd(m_SectorMinX+2,m_SectorMinX+m_SectorCntX-3);
+			y=m_Rnd.Rnd(m_SectorMinY+2,m_SectorMinY+m_SectorCntY-3);
+
+			if(FindGate(x,y,5)) continue;
+			if(FindBorder(x,y,3)) continue;
+			if(!AddGate2(x,y,island,island+1)) continue;
+			islandignore[island+(island+1)*islandignoresize]=1;
+			islandignore[(island+1)+island*islandignoresize]=1;
+			island+=2;
+		}
+		int * islandsize=(int *)HAlloc(island*sizeof(int)+island*2*sizeof(int),m_Heap);
+		int * islandborder=islandsize+island;
+//ALogFormat("!!!FP02");
+
+		int islandmaxsize=2000;
+		for(t=0;t<10000;t++) {
+			GrowGateIsland(1000000);
+
+			CalcGateIslandSize(islandsize,island);
+
+			int mins=1000000000;
+
+			while(true) {
+				mins=1000000000;
+				u=-1;
+				for(i=1;i<island;i++) {
+					if(islandsize[i]>0 && islandsize[i]<mins) { mins=islandsize[i]; u=i; }
+				}
+//ALogFormat("!!!CC00 i=<i> s=<i>",u,mins);
+				if(u<0) break;
+				if(mins>islandmaxsize) break;
+
+	    	    int bordercnt=CalcGateIslandBorder(u,islandborder,island<<1);
+//ALogFormat("!!!CC01 bordercnt=<i>",bordercnt);
+				if(bordercnt<=0) { islandsize[u]=0; continue; }
+
+				int mini=-1;
+				int minb=0;
+				for(k=0;k<bordercnt;k++) {
+					int ci=islandborder[(k<<1)+0];
+					if(islandignore[ci+u*islandignoresize]) continue;
+					if(islandsize[u]+islandsize[ci]>islandmaxsize) continue;
+					if(mini<0 || islandborder[(k<<1)+1]<minb) { minb=islandborder[(k<<1)+1]; mini=ci; }
+				}
+				if(mini<0) { islandsize[u]=0; continue; }
+
+	    	    ChangeGateIsland(u,mini);
+				for(k=0;k<islandignoresize;k++) {
+					islandignore[mini+k*islandignoresize]=max(islandignore[mini+k*islandignoresize],islandignore[u+k*islandignoresize]);
+					islandignore[k+mini*islandignoresize]=max(islandignore[k+mini*islandignoresize],islandignore[k+u*islandignoresize]);
+				}
+
+				islandsize[u]=0;
+
+				break;
+			}
+			if(mins>islandmaxsize) break;
+		}
+//ALogFormat("!!!FP03");
+
+		while(true) {
+			CalcGateIslandSize(islandsize,island);
+
+			int is0=-1;
+			int is1=-1;
+			int bscore=0;
+
+			for(u=0;u<island;u++) {
+	    	    int bordercnt=CalcGateIslandBorder(u,islandborder,island<<1);
+				for(k=0;k<bordercnt;k++) {
+					int ci=islandborder[(k<<1)+0];
+					int calcdist=CalcGateIslandDist(u,ci);
+
+					if(calcdist<15) continue;
+
+					int score=islandsize[u]+islandsize[ci];
+					if(is0<0 || score<bscore) {
+						bscore=score;
+						is0=u;
+						is1=ci;
+					}
+				}
+			}
+			if(is0<0) break;
+
+    	    ChangeGateIsland(is0,is1);
+			GrowGateIsland(1000000);
+		}
+//ALogFormat("!!!FP04");
+
+		HFree(islandsize,m_Heap);
+		HFree(islandignore,m_Heap);
+
+		cnt=m_SectorCntX*m_SectorCntY;
+		sec=m_Sector;
+//		int cnt0=0,cnt1=0;
+		for(i=0;i<cnt;i++,sec++) {
+			sec->m_Infl=0;
+			sec->m_InflOwner=0;
+
+			if(sec->m_PlanetCnt==-2) sec->m_PlanetCnt=0;
+			else if(sec->m_PlanetCnt==-3) { sec->m_PlanetCnt=1; }
+			else if(sec->m_PlanetCnt==0) sec->m_PlanetCnt=-1;
+
+//			if(sec->m_PlanetCnt>=0) cnt1++;
+//			else cnt0++;
+		}
+//ALogFormat("!!!CntSector <i>,<i>",cnt0,cnt1);
+//ALogFormat("!!!FP05");
+
+/*		x=m_SectorMinX; y=m_SectorMinY;
+		sec=GetSector(x,y); sec->m_PlanetCnt=-1;
+		sec=GetSector(x+1,y); sec->m_PlanetCnt=-1;
+		sec=GetSector(x,y+1); sec->m_PlanetCnt=-1;
+
+		x=m_SectorMinX+m_SectorCntX-1; y=m_SectorMinY+m_SectorCntY-1;
+		sec=GetSector(x,y); sec->m_PlanetCnt=-1;
+		sec=GetSector(x-1,y); sec->m_PlanetCnt=-1;
+		sec=GetSector(x,y-1); sec->m_PlanetCnt=-1;
+
+		x=m_SectorMinX; y=m_SectorMinY+m_SectorCntY-1;
+		sec=GetSector(x,y); sec->m_PlanetCnt=-1;
+		sec=GetSector(x+1,y); sec->m_PlanetCnt=-1;
+		sec=GetSector(x,y-1); sec->m_PlanetCnt=-1;
+
+		x=m_SectorMinX+m_SectorCntX-1; y=m_SectorMinY;
+		sec=GetSector(x,y); sec->m_PlanetCnt=-1;
+		sec=GetSector(x-1,y); sec->m_PlanetCnt=-1;
+		sec=GetSector(x,y+1); sec->m_PlanetCnt=-1;
+*/
+		// Средние объекты
+		int e20[256];
+		int e20cnt=CreateHoleTempl(e20,
+		" xx           \n"
+		"  xxxx        \n"
+		"     xxxxx    \n"
+		"         xxx  \n"
+		"           xxx\n"
+		);
+		int e21[256];
+		int e21cnt=CreateHoleTempl(e21,
+		"  xxxx    xxxx \n"
+		" xx      xx  xx\n"
+		"xx      xx     \n"
+		"            xxx\n"
+		"           xx  \n"
+		"          xx   \n"
+		);
+		int e22[256];
+		int e22cnt=CreateHoleTempl(e22,
+		" xx   xx  \n"
+		"xx   xx   \n"
+		" xx     xx\n"
+		"  xx    x \n"
+		"   xxxx   \n"
+		);
+		int e23[256];
+		int e23cnt=CreateHoleTempl(e23,
+		"  xxxx    \n"
+		"     xxxx \n"
+		"        xx\n"
+		"         x\n"
+		"         x\n"
+		"xxx    xxx\n"
+		"  xxxx    \n"
+		);
+		int e24[1024];
+		int e24cnt=CreateHoleTempl(e24,
+/*		"    xxxxxx     \n"
+		"  xxxxxxxxxx   \n"
+		"  xxxxxxxxxx   \n"
+		" xxxxxxxxxxxx  \n"
+		"xxxxxxxxxxxxxx \n"
+		"xxxxxxxxxxxxxxx\n"
+		" xxxxxxxxxxxxxx\n"
+		" xxxxxxxxxxxxx \n"
+		"  xxxxxxxxxxx  \n"
+		"  xxxxxxxxxxx  \n"
+		"  xxxxxxxxxx   \n"
+		"   xxxxxxx     \n"*/
+
+		"              xxx              \n"
+		"           xxxxxxxxx           \n"
+		"        xxxxxxxxxxxxxxx        \n"
+		"      xxxxxxxxxxxxxxxxxxx      \n"
+		"     xxxxxxxxxxxxxxxxxxxxx     \n"
+		"    xxxxxxxxxxxxxxxxxxxxxxx    \n"
+		"   xxxxxxxxxxxxxxxxxxxxxxxxx   \n"
+		"   xxxxxxxxxxxxxxxxxxxxxxxxx   \n"
+		"  xxxxxxxxxxxxxxxxxxxxxxxxxxx  \n"
+		"  xxxxxxxxxxxxxxxxxxxxxxxxxxx  \n"
+		" xxxxxxxxxxxxxxxxxxxxxxxxxxxxx \n"
+		" xxxxxxxxxxxxxxxxxxxxxxxxxxxxx \n"
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+		"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n"
+		" xxxxxxxxxxxxxxxxxxxxxxxxxxxxx \n"
+		" xxxxxxxxxxxxxxxxxxxxxxxxxxxxx \n"
+		"  xxxxxxxxxxxxxxxxxxxxxxxxxxx  \n"
+		"  xxxxxxxxxxxxxxxxxxxxxxxxxxx  \n"
+		"   xxxxxxxxxxxxxxxxxxxxxxxxx   \n"
+		"   xxxxxxxxxxxxxxxxxxxxxxxxx   \n"
+		"    xxxxxxxxxxxxxxxxxxxxxxx    \n"
+		"     xxxxxxxxxxxxxxxxxxxxx     \n"
+		"      xxxxxxxxxxxxxxxxxxx      \n"
+		"        xxxxxxxxxxxxxxx        \n"
+		"          xxxxxxxxxxx          \n"
+		"            xxxxxxx            \n"
+		"              xxx              \n"
+		);
+
+//		for(u=0;u<8;u++) {
+//			CreateHoleSpecial(e24,e24cnt,1,(min(m_SectorCntX,m_SectorCntY)>>2)+(min(m_SectorCntX,m_SectorCntY)>>2));
+//		}
+/*		int ttt=m_Rnd.Rnd(0,100);
+		if(ttt<50) {
+			ttt=m_Rnd.Rnd(0,m_SectorCntX-1);
+			CreateHoleXY(e24,e24cnt,m_SectorMinX+ttt,m_SectorMinY-1);
+			CreateHoleXY(e24,e24cnt,m_SectorMinX+m_SectorCntX-ttt,m_SectorMinY+m_SectorCntY);
+		} else {
+			ttt=m_Rnd.Rnd(0,m_SectorCntY-1);
+			CreateHoleXY(e24,e24cnt,m_SectorMinX-1,m_SectorMinY+ttt);
+			CreateHoleXY(e24,e24cnt,m_SectorMinX+m_SectorCntX,m_SectorMinY+m_SectorCntY-ttt);
+		}
+
+		for(u=0;u<m_SectorCntX*m_SectorCntY;u++) {
+			int v=m_Rnd.Rnd(0,80);
+			if(v<15) CreateHoleSpecial(e20,e20cnt,1);
+			else if(v<50) CreateHoleSpecial(e21,e21cnt,1);
+			else if(v<60) CreateHoleSpecial(e22,e22cnt,1);
+			else if(v<70) CreateHoleSpecial(e23,e23cnt,1);
+//			else CreateHoleSpecial(e24,e24cnt,50,(min(m_SectorCntX,m_SectorCntY)>>2)+(min(m_SectorCntX,m_SectorCntY)>>3));
+		}*/
+//ALogFormat("!!!FP06");
+
+	} else if(m_SessionPeriod || m_SectorCntX<10 || m_SectorCntY<10) {
+		// Средние объекты
+		int e20[256];
+		int e20cnt=CreateHoleTempl(e20,
+		"  x               \n"
+		"  xx              \n"
+		"   xx             \n"
+		"    xxx  xx       \n"
+		"          xxxx    \n"
+		"             xxx  \n"
+		);
+		int e21[256];
+		int e21cnt=CreateHoleTempl(e21,
+		"   xxxxx    xxxxx \n"
+		"  xx      xxx   xx\n"
+		" xx               \n"
+		"               xxx\n"
+		"   xx         xx  \n"
+		"    xxxxx   xxx   \n"
+		);
+		for(u=0;u<m_SectorCntX*m_SectorCntY;u++) {
+			CreateHole(e20,e20cnt,5);
+			CreateHole(e21,e21cnt,5);
+		}
+
+	} else if(m_SessionPeriod || m_SectorCntX<70 || m_SectorCntY<70) {
+		// Создаем внешние границы
+//ALogFormat("!!!FP01");
+		while(true) {
+			cnt=m_SectorCntX*m_SectorCntY;
+			sec=m_Sector;
+			for(i=0;i<cnt;i++,sec++) {
+				sec->m_Infl=0;
+				sec->m_InflOwner=0;
+				sec->m_PlanetCnt=-1;
+			}
+
+			int linecnt=(m_SectorCntX+m_SectorCntY)/8;
+			if(linecnt<=0) linecnt=1;
+			int linesize=5;
+			if(m_CotlSize>50) linesize=6;
+
+			int inr=max(m_SectorCntX,m_SectorCntY)/2;
+
+			for(i=0;i<linecnt;i++) {
+				int x1=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y1=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				if((x1*x1+y1*y1)>inr*inr) continue;
+
+				int x2=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y2=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				if((x2*x2+y2*y2)>inr*inr) continue;
+
+				int r=(x2-x1)*(x2-x1)+(y2-y1)*(y2-y1);
+				int d=inr>>2;
+
+				/*if(i==0) d=d+(d>>3);
+				else*/ if(i==0);
+				else d=(d>>1)+(d>>2);
+
+				if(r<d*d) { i--; continue; }
+
+				if(m_SectorCntX<20 || m_SectorCntY<20) FillLineSpecial(x1,y1,x2,y2,m_Rnd.Rnd(1,2),m_Rnd.Rnd(1,2),0);
+				else if(m_SectorCntX<50 || m_SectorCntY<50) FillLineSpecial(x1,y1,x2,y2,m_Rnd.Rnd(1,3),m_Rnd.Rnd(1,3),0);
+				else FillLineSpecial(x1,y1,x2,y2,m_Rnd.Rnd(2,4),m_Rnd.Rnd(2,4),0);
+//ALogFormat("!!!FLS<i> <i>,<i>,<i>,<i>",i,x1,y1,x2,y2);
+			}
+
+			int rndrange=max(m_SectorCntX,m_SectorCntY)/5;
+			if(rndrange<5) rndrange=5;
+
+			int crp=0;
+			for(i=0;i<linecnt && crp<linecnt*10;i++,crp++) {
+				int x1=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y1=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				int x2=x1+m_Rnd.Rnd(-rndrange,rndrange);
+				int y2=y1+m_Rnd.Rnd(-rndrange,rndrange);
+				int r=(x2-x1)*(x2-x1)+(y2-y1)*(y2-y1);
+
+				if(r<5*5) { i--; continue; }
+				if(r>10*10) { i--; continue; }
+
+				sec=GetSector(x1,y1);
+				if(sec==NULL) { i--; continue; }
+				if(sec->m_PlanetCnt!=-1) { i--; continue; }
+
+				sec=GetSector(x2,y2);
+				if(sec==NULL) { i--; continue; }
+				if(sec->m_PlanetCnt!=0) { i--; continue; }
+
+				if(m_SectorCntX<30 || m_SectorCntY<30) FillLineSpecial(x1,y1,x2,y2,m_Rnd.Rnd(1,2),m_Rnd.Rnd(1,2),0);
+				else FillLineSpecial(x1,y1,x2,y2,m_Rnd.Rnd(2,4),m_Rnd.Rnd(2,4),0);
+//ALogFormat("!!!FLS<i> <i>,<i>,<i>,<i>",i,x1,y1,x2,y2);
+			}
+			if(crp>=linecnt*10) continue;
+
+			int cntb=CalcCntBound();
+//ALogFormat("!!!CntBound <i>",cntb);
+			if(cntb<((m_SectorCntX*m_SectorCntY)/7)) continue;
+
+			break;
+		}
+//ALogFormat("!!!FP03");
+
+		int e20[256];
+		int e20cnt=CreateHoleTempl(e20,
+		"  x               \n"
+		"  xx              \n"
+		"   xx             \n"
+		"    xxx  xx       \n"
+		"          xxxx    \n"
+		"             xxx  \n"
+		);
+		int e21[256];
+		int e21cnt=CreateHoleTempl(e21,
+		"   xxxxx    xxxxx \n"
+		"  xx      xxx   xx\n"
+		" xx               \n"
+		"               xxx\n"
+		"   xx         xx  \n"
+		"    xxxxx   xxx   \n"
+		);
+		for(u=0;u<m_SectorCntX*m_SectorCntY;u++) {
+			CreateHole(e20,e20cnt,5);
+			CreateHole(e21,e21cnt,5);
+		}
+//ALogFormat("!!!FP04");
+
+	} else {
+//ALogFormat("!!!FP00");
+		// Создаем внешние границы
+		int subcntb=0;
+		while(true) {
+			cnt=m_SectorCntX*m_SectorCntY;
+			sec=m_Sector;
+			for(i=0;i<cnt;i++,sec++) {
+				sec->m_Infl=0;
+				sec->m_InflOwner=0;
+				sec->m_PlanetCnt=-1;
+			}
+//		FillCircleSpecial(0,0,m_SectorCntX/2-1,0);
+//ALogFormat("!!!FP00a");
+
+			int linecnt=(m_SectorCntX+m_SectorCntY)/8;
+			if(linecnt<=0) linecnt=1;
+			int linesize=5;//min(m_SectorCntX,m_SectorCntY)/6;
+			if(m_CotlSize>50) linesize=6;
+
+			int inr=max(m_SectorCntX,m_SectorCntY)/2;
+			int addr=max(m_SectorCntX,m_SectorCntY)/60;
+
+			for(i=0;i<linecnt;i++) {
+				int x1=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y1=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				if((x1*x1+y1*y1)>inr*inr) continue;
+
+				int x2=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y2=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				if((x2*x2+y2*y2)>inr*inr) continue;
+
+				int r=(x2-x1)*(x2-x1)+(y2-y1)*(y2-y1);
+				int d=inr>>2;
+
+				/*if(i==0) d=d+(d>>3);
+				else*/ if(i==0);
+				else d=(d>>1)+(d>>2);
+
+				if(r<d*d) { i--; continue; }
+
+				FillLineSpecial(x1,y1,x2,y2,m_Rnd.Rnd(4,8)+addr,m_Rnd.Rnd(4,8)+addr,0);
+//ALogFormat("!!!FLS<i> <i>,<i>,<i>,<i>",i,x1,y1,x2,y2);
+			}
+//ALogFormat("!!!FP00b");
+
+			for(i=0;i<linecnt;i++) {
+				int x1=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+				int y1=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+				int x2=x1+m_Rnd.Rnd(-20,20);
+				int y2=y1+m_Rnd.Rnd(-20,20);
+				int r=(x2-x1)*(x2-x1)+(y2-y1)*(y2-y1);
+
+				if(r<5*5) { i--; continue; }
+				if(r>10*10) { i--; continue; }
+
+				sec=GetSector(x1,y1);
+				if(sec==NULL) { i--; continue; }
+				if(sec->m_PlanetCnt!=-1) { i--; continue; }
+
+				sec=GetSector(x2,y2);
+				if(sec==NULL) { i--; continue; }
+				if(sec->m_PlanetCnt!=0) { i--; continue; }
+
+				FillLineSpecial(x1,y1,x2,y2,m_Rnd.Rnd(3,6),m_Rnd.Rnd(3,6),0);
+//ALogFormat("!!!FLS<i> <i>,<i>,<i>,<i>",i,x1,y1,x2,y2);
+			}
+
+			int cntb=CalcCntBound();
+//ALogFormat("!!!",cntb);
+			int needcnt=((m_SectorCntX*m_SectorCntY)/7)-subcntb;
+//ALogFormat("!!!FP00c CntBound:<i> need:<i>",cntb,needcnt);
+			if(cntb<=needcnt) { subcntb+=max(1,needcnt>>3); continue; }
+
+			break;
+		}
+//ALogFormat("!!!FP01");
+
+
+/*		cnt=m_SectorCntX*m_SectorCntY;
+		sec=m_Sector;
+		for(i=0;i<cnt;i++,sec++) {
+			sec->m_Infl=0;
+			sec->m_InflOwner=0;
+
+			if(sec->m_PlanetCnt==-1) { sec->m_PlanetCnt=0; }
+			else if(sec->m_PlanetCnt==0) sec->m_PlanetCnt=-1;
+		}*/
+
+		// Большие объекты
+		int e20[256];
+		int e20cnt=CreateHoleTempl(e20,
+		"  x                                          \n"
+		"  xx                                         \n"
+		"   xx                                        \n"
+		"    xxx                                      \n"
+		"      xxx                                    \n"
+		"        xx                                   \n"
+		"         xxx                       xxxx      \n"
+		"           xxx                  xxxx  xxx    \n"
+		"             xxxx           xxxxx       xxxx \n"
+		"                xxxxx    xxxx              x \n"
+		"                    xxxxxx                   \n"
+		);
+		int e21[256];
+		int e21cnt=CreateHoleTempl(e21,
+		"              xxxxx                          \n"
+		"           xxxx   xxxx         xxxxx  xx     \n"
+		"          xx         xxxx  xxxxx       xx    \n"
+		"        xxx             xxxx            x    \n"
+		"        x                             xxx    \n"
+		"        xx                           xx      \n"
+		"         xxx                       xxx       \n"
+		"                                xxxx         \n"
+		"             xxxx           xxxxx            \n"
+		"                xxxxx    xxxx                \n"
+		"                    xxxxxx                   \n"
+		);
+		int e22[256];
+		int e22cnt=CreateHoleTempl(e22,
+		"                    x                        \n"
+		"                    xx                 xxxx  \n"
+		"                     x              xxxx     \n"
+		"                     x           xxxx        \n"
+		"       xxxxx                  xxxx           \n"
+		"    xxxx   xxxxxxxx     xxxxxxx              \n"
+		"  xxx                                        \n"
+		"                   xx xx                     \n"
+		"                  xx   xx                    \n"
+		"                xxx     xxxxxxx              \n"
+		"              xxx                            \n"
+		);
+		for(u=0;u<m_SectorCntX*m_SectorCntY;u++) {
+			CreateHole(e20,e20cnt,5);
+			CreateHole(e21,e21cnt,5);
+			CreateHole(e22,e22cnt,5);
+		}
+//ALogFormat("!!!FP02");
+	}
+
+//ALogFormat("!!!FP05");
+	// Малые линии
+	int e01[16];
+	int e01cnt=CreateHoleTempl(e01,
+		"xx  \n"
+		" xx \n"
+		"  xx\n"
+	);
+	int e02[16];
+	int e02cnt=CreateHoleTempl(e02,
+		"x\n"
+		"x\n"
+		"x\n"
+	);
+	int e03[16];
+	int e03cnt=CreateHoleTempl(e03,
+		"xxx\n"
+	);
+
+	for(u=0;u<m_SectorCntX*m_SectorCntY;u++) {
+		CreateHole(e01,e01cnt,10);
+		CreateHole(e02,e02cnt,10);
+		CreateHole(e03,e03cnt,10);
+	}
+
+    // Дырки 1x1
+	int e10[16];
+	int e10cnt=CreateHoleTempl(e10,"x");
+	for(u=0;u<m_SectorCntX*m_SectorCntY;u++) {
+		CreateHole(e10,e10cnt,10);
+	}
+//ALogFormat("!!!FP06");
+
+//ALogFormat("!!!FP07");
+	// Пульсары
+	sec=m_Sector;
+	cnt=m_SectorCntX*m_SectorCntY;
+	for(i=0;i<cnt;i++,sec++) {
+		if(sec->m_PlanetCnt!=1) continue;
+		planet=sec->m_Planet;
+		planet->m_PosX=sec->m_SectorX*SectorSize+(SectorSize>>1);
+		planet->m_PosY=sec->m_SectorY*SectorSize+(SectorSize>>1);
+		planet->m_Flag|=PlanetFlagSun|PlanetFlagLarge;
+		sec->m_PlanetCnt=1;
+	}
+
+//ALogFormat("!!!FP07");
+//ALogFormat("!!!FP08");
+	// Другие объекты
+	int prndfrom=PlanetMinDist/4;
+	int prndto=SectorSize-PlanetMinDist/4;
+	int dirfromcenter2=(SectorSize>>2)*(SectorSize>>2);
+	int mr2=PlanetMinDist*PlanetMinDist;
+
+	int deadspace=50;
+	int cntnochangelast=0;
+	int cntnochange=0;
+
+	bool again=false;
+	int cntperpass=0;
+	int loopcnt=0;
+	x=0;
+	y=0;
+	while(true) {
+		if(y>=m_SectorCntY) {
+			ALogFormat("CreateMap CntPerPass=<i>",cntperpass);
+			if(!again) break;
+			if(cntnochangelast==cntperpass) {
+				cntnochangelast=cntperpass;
+				cntnochange=0;
+			}
+			cntnochange++;
+			if(cntnochange>20 && deadspace==50) {
+				deadspace=40;
+				prndfrom=PlanetMinDist/6;
+				prndto=SectorSize-PlanetMinDist/6;
+
+			} else if(cntnochange>50 && deadspace==40) {
+				deadspace=30;
+			}
+			x=0;
+			y=0;
+			again=false;
+			cntperpass=0;
+			loopcnt++;
+//if(loopcnt>500 && cntperpass==1) break;
+			if(loopcnt>1000) return false;
+		}
+		sec=m_Sector + (x+y*m_SectorCntX);
+
+		sec->m_Ver++;
+		sec->m_VerSlow++;
+
+		if(sec->m_PlanetCnt!=0 || sec->m_InflOwner) {
+			x++; if(x>=m_SectorCntX) { x=0; y++; }
+			continue;
+		}
+		cntperpass++;
+
+//		sec->m_Infl=0;
+
+		int smex=(x+m_SectorMinX)*SectorSize;
+		int smey=(y+m_SectorMinY)*SectorSize;
+
+//ALogFormat("Build sector <i>,<i> <i>",x+m_SectorMinX,y+m_SectorMinY,cntperpass);
+
+		//int rrr;
+		//for(rrr=0;rrr<10;rrr++) {
+			int cntpl=m_Rnd.Rnd(PlanetOnSectorMin,PlanetOnSectorMaxSys);
+//ALogFormat("Sector <i> <i>",m_SectorMinX+x,m_SectorMinY+y);
+
+			for(i=0;i<cntpl;i++) {
+				for(t=0;t<100;t++) {
+					px=m_Rnd.Rnd(prndfrom,prndto);
+					py=m_Rnd.Rnd(prndfrom,prndto);
+
+//					if(cntpl>2) { // Если планет много то нет смысла в центре размещать
+//						int dcx=px-(SectorSize>>1);
+//						int dcy=py-(SectorSize>>1);
+//						if((dcx*dcx+dcy*dcy)<dirfromcenter2) { t--; continue; }
+//					}
+
+					planet=sec->m_Planet;
+					for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+						int tx=px+smex-planet->m_PosX;
+						int ty=py+smey-planet->m_PosY;
+						if((tx*tx+ty*ty)<mr2) break;
+					}
+//					if(u<sec->m_PlanetCnt) continue;
+
+					if(!IsCorrectPlaceForPlanet(px+smex,py+smey,x+m_SectorMinX,y+m_SectorMinY,deadspace)) continue;
+
+					break;
+				}
+				if(t>=100) continue;
+//ALogFormat("    <i> <i> t=<i>",px,py,t);
+
+				planet=sec->m_Planet+sec->m_PlanetCnt;
+				planet->m_Flag=0;
+				planet->m_PosX=px+smex;
+				planet->m_PosY=py+smey;
+				sec->m_PlanetCnt++;
+			}
+			if(sec->m_PlanetCnt!=cntpl) sec->m_PlanetCnt=0;
+			else if(IsConnectAll(x+m_SectorMinX,y+m_SectorMinY)) { sec->m_PlanetCnt=0; sec->m_Infl++; }
+		//}
+
+		if(sec->m_PlanetCnt>0) {
+			x++; if(x>=m_SectorCntX) { x=0; y++; }
+		} else {
+			again=true;
+
+//if(deadspace==30) ALogFormat("Again <i>,<i>",m_SectorMinX+x,m_SectorMinX+y);
+
+			if(sec->m_Infl>8) {
+				int fsx=max(m_SectorMinX,x+m_SectorMinX-2);
+				int fsy=max(m_SectorMinY,y+m_SectorMinY-2);
+				int esx=min(m_SectorMinX+m_SectorCntX,x+m_SectorMinX+3);
+				int esy=min(m_SectorMinY+m_SectorCntY,y+m_SectorMinY+3);
+
+//ALogFormat("rrr=<i> clear=<i>,<i>,<i>,<i>",rrr,fsx,fsy,esx,esy);
+				sec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+				for(int sy=fsy;sy<esy;sy++,sec+=m_SectorCntX-(esx-fsx)) {
+					for(int sx=fsx;sx<esx;sx++,sec++) {
+						if(sec->m_PlanetCnt>0 && (sec->m_Planet->m_Flag & (PlanetFlagSun|PlanetFlagGigant))) continue;
+						if(!sec->m_InflOwner && sec->m_PlanetCnt>0) { sec->m_PlanetCnt=0; sec->m_Infl=0; }
+					}
+				}
+			}
+
+			x++; if(x>=m_SectorCntX) { x=0; y++; }
+		}
+	}
+
+//ALogFormat("!!!FP09");
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		if(sec->m_PlanetCnt<0) sec->m_PlanetCnt=0;
+//	    allplanetcnt+=sec->m_PlanetCnt;
+		sec->m_Infl=0;
+		if(sec->m_InflOwner) continue;
+
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if(planet->m_Flag & (PlanetFlagSun|PlanetFlagGigant)) {
+				planet->m_Level=0;
+				planet->m_LevelBuy=0;
+//				planet->m_ConstructionPoint=0;
+				planet->m_ConstructionTime=m_CalcTime;
+				planet->m_CalcBattleTime=m_CalcTime;
+				planet->m_TransportTime=m_CalcTime;
+				planet->m_Race=RaceNone;
+				planet->m_OreItem=ItemTypeNone;
+			} else {
+				planet->m_Level=m_Rnd.Rnd(5,10);
+				planet->m_LevelBuy=0;
+//				planet->m_ConstructionPoint=m_Rnd.Rnd(50,100);
+				planet->m_ConstructionTime=m_CalcTime;
+				planet->m_CalcBattleTime=m_CalcTime;
+				planet->m_TransportTime=m_CalcTime;
+				planet->m_Race=m_Rnd.Rnd(RaceGrantar,RaceGaal);
+				if(m_Rnd.Rnd(0,100)<30) planet->m_Flag|=PlanetFlagLarge;
+//				planet->m_ConstructionPoint=0;
+				planet->m_OreItem=ItemTypeNone;
+//				planet->m_BuildTime=ct;
+			}
+		}
+	}
+//ALogFormat("!!!FP10");
+
+	return true;
+}
+
+void CEmpire::CreateMap(int sx,int sy)
+{
+	int i,u,t,x,y,px,py,tx,ty,cnt;
+	SSector * sec;
+	SPlanet * planet;
+
+	if(sx<10) sx=10;
+	else if(sx>500) sx=500;
+//	else if(sx>100) sx=100;
+	if(sy<10) sy=10;
+	else if(sy>500) sy=500;
+//	else if(sy>100) sy=100;
+
+	while(true) {
+		Clear();
+
+		m_SectorMinX=-sx/2;
+		m_SectorMinY=-sy/2;
+
+		//m_Sector=(SSector *)HAllocClear(cnt*sizeof(SSector),m_Heap);
+		CreateSector(sx,sy,sx*sy*PlanetOnSectorMaxSys);
+
+//ALogFormat("!!!CM00");
+		int planetnewcnt=0;
+    	sec=m_Sector;
+	    for(y=0;y<m_SectorCntY;y++) {
+    	    for(x=0;x<m_SectorCntX;x++,sec++) {
+	            sec->m_Planet=m_Planet+planetnewcnt;
+            	planetnewcnt+=PlanetOnSectorMaxSys;
+        	}
+    	}
+	    if(planetnewcnt!=m_SectorCntX*m_SectorCntY*PlanetOnSectorMaxSys) ERROR_E;
+
+//ALogFormat("!!!CM01");
+		InitPtr();
+
+		cnt=m_SectorCntX*m_SectorCntY;
+//		m_SectorSaveDataAll=(SSectorSaveData *)HAlloc((cnt<<1)*sizeof(SSectorSaveData),m_Heap);
+//		m_SectorSaveDataEmpty=m_SectorSaveDataAll;
+//		SSectorSaveData * ssd=m_SectorSaveDataAll;
+//		for(i=0;i<(cnt<<1)-1;i++,ssd++) ssd->m_Next=ssd+1;
+//		ssd->m_Next=NULL;
+
+		if(!FillPlanet()) continue;
+
+//ALogFormat("!!!CM02");
+		if(!PulsarClearNear()) ERROR_E;
+
+//ALogFormat("!!!CM03");
+		CreateWormhole();
+
+		if(m_CotlType==SEmpireCotl::TypeUser) {
+			if(!TestConnectAllPlanet(false)) continue;
+			AllConvertToSun();
+			if(!TestConnectAllPlanet(false)) continue;
+		} else {
+			if(!TestConnectAllPlanet(true)) continue;
+			AllConvertToSun();
+			if(!TestConnectAllPlanet(true)) continue;
+		}
+
+		int all_suncnt=0;
+		int all_normalcnt=0;
+		int all_othercnt=0;
+		int all_wormholecnt=0;
+
+//ALogFormat("!!!CM04");
+		// Print stat
+		cnt=m_SectorCntX*m_SectorCntY;
+		sec=m_Sector;
+		for(i=0;i<cnt;i++,sec++) {
+			planet=sec->m_Planet;
+			for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+				if(planet->m_Flag & PlanetFlagWormhole) all_wormholecnt++;
+				else if(planet->m_Flag & PlanetFlagSun) all_suncnt++;
+				else if(planet->m_Flag & PlanetFlagGigant) all_othercnt++;
+				else all_normalcnt++;
+			}
+		}
+
+		if(m_CotlType==SEmpireCotl::TypeUser) {
+//			if(all_normalcnt<400 || all_normalcnt>500) continue;
+//            if(all_normalcnt<460) continue;
+//            if(all_wormholecnt<80) continue;
+            if(all_normalcnt<400) continue;
+		}
+
+		ALogFormat("CreateMap SunCnt=<i> NormalCnt=<i> OtherCnt=<i> WormholeCnt=<i>",all_suncnt,all_normalcnt,all_othercnt,all_wormholecnt);
+		break;
+	}
+
+	AssignOreItem();
+	if(m_CotlType==SEmpireCotl::TypeRich) {
+		AllConvertToRich();
+	}
+	ATTRnd();
+}
+
+/*void CEmpire::GrowMap(int newsx,int newsy)
+{
+	int i,x,y;
+
+	if(!m_Sector) ERROR_E;
+
+	if(newsx<m_SectorCntX) return;
+	if(newsy<m_SectorCntY) return;
+	if(newsx==m_SectorCntX && newsy==m_SectorCntY) return;
+
+	int old_minx=m_SectorMinX;
+	int old_miny=m_SectorMinY;
+	int old_cntx=m_SectorCntX;
+	int old_cnty=m_SectorCntY;
+	SSector * old_sec=m_Sector;
+	m_Sector=NULL;
+
+	int addsx=(newsx-m_SectorCntX)>>1;
+	int addsy=(newsy-m_SectorCntY)>>1;
+
+	m_SectorMinX-=addsx;
+	m_SectorMinY-=addsy;
+
+	CreateSector(newsx,newsy);
+	int cnt=m_SectorCntX*m_SectorCntY;
+
+//	if(m_SectorSaveDataAll) {
+//		HFree(m_SectorSaveDataAll,m_Heap);
+//		m_SectorSaveDataAll=NULL;
+//	}
+//	m_SectorSaveDataEmpty=NULL;
+
+//	m_SectorSaveDataAll=(SSectorSaveData *)HAlloc((cnt<<1)*sizeof(SSectorSaveData),m_Heap);
+//	m_SectorSaveDataEmpty=m_SectorSaveDataAll;
+//	SSectorSaveData * ssd=m_SectorSaveDataAll;
+//	for(i=0;i<(cnt<<1)-1;i++,ssd++) ssd->m_Next=ssd+1;
+//	ssd->m_Next=NULL;
+
+	for(y=0;y<old_cnty;y++) {
+		for(x=0;x<old_cntx;x++) {
+			SSector * src=old_sec+(x+y*old_cntx);
+			SSector * des=m_Sector+(addsx+x+(addsy+y)*m_SectorCntX);
+
+			MemCopy(des,src,sizeof(SSector));
+			des->m_InflOwner=1;
+		}
+	}
+
+	HFree(old_sec,m_Heap);
+
+	InitPtr();
+
+	FillPlanet();
+
+	CreateWormhole();
+
+	AssignOreItem();
+
+	SSector * sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		sec->m_Infl=0;
+		sec->m_InflOwner=0;
+	}
+}*/
+
+bool CEmpire::IsCorrectPlaceForPlanet(int x,int y,int secx,int secy,int deadspace,int t,SPlanet * skip)
+{
+//	int deadspace=50;
+
+	int mr2=PlanetMinDist*PlanetMinDist;
+	if(t) mr2=t*t;
+
+	int cnt=(m_OpsJumpRadius+deadspace)/SectorSize+1;
+	int fsx=max(m_SectorMinX,secx-cnt);
+	int fsy=max(m_SectorMinY,secy-cnt);
+	int esx=min(m_SectorMinX+m_SectorCntX,secx+cnt+1);
+	int esy=min(m_SectorMinY+m_SectorCntY,secy+cnt+1);
+
+	int ds2min=(m_OpsJumpRadius-deadspace)*(m_OpsJumpRadius-deadspace);
+	int ds2max=(m_OpsJumpRadius+deadspace)*(m_OpsJumpRadius+deadspace);
+
+	SSector * cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+	for(int sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+		for(int sx=fsx;sx<esx;sx++,cursec++) {
+			SPlanet * planet=cursec->m_Planet;
+			for(int u=0;u<cursec->m_PlanetCnt;u++,planet++) {
+				if(planet==skip) continue;
+				int tx=x-planet->m_PosX;
+				int ty=y-planet->m_PosY;
+                int r=tx*tx+ty*ty;
+				if(r<mr2) {
+//if(secx==-48 && secy==-47) {
+//ALogFormat("    r=<i> <i> Planet=<i>,<i>,<i>/<i>",r,mr2,cursec->m_SectorX,cursec->m_SectorY,u,cursec->m_PlanetCnt);
+//}
+					return false;
+				}
+
+//if(t==0) {
+				if(r>ds2min && r<ds2max) return false;
+//}
+
+//if(t==0) {
+				if(r<ds2max) {
+					if(((secx-sx)>1) || ((secx-sx)<-1) || ((secy-sy)>1) || ((secy-sy)<-1)) {
+//						/*if(r<ds2max)*/ return false;
+					}
+				}
+//}
+			}
+		}
+	}
+
+	return true;
+}
+
+bool CEmpire::IsConnectSector(SSector * sec,SSector * sec2)
+{
+	int jr2=JumpRadius2;
+
+	SPlanet * planet=sec->m_Planet;
+	for(int i=0;i<sec->m_PlanetCnt;i++,planet++) {
+		SPlanet * planet2=sec2->m_Planet;
+		for(int u=0;u<sec2->m_PlanetCnt;u++,planet2++) {
+			int x=planet->m_PosX-planet2->m_PosX;
+			int y=planet->m_PosY-planet2->m_PosY;
+
+			if((x*x+y*y)<jr2) return true;
+		}
+	}
+	return false;
+}
+
+dword CEmpire::IsConnectAll(int secx,int secy)
+{
+	bool up_empty=false;
+	bool down_empty=false;
+	bool left_empty=false;
+	bool right_empty=false;
+
+    SSector * sec=m_Sector + ((secx-m_SectorMinX)+(secy-m_SectorMinY)*m_SectorCntX);
+	SSector * cursec;
+
+	dword r=0;
+
+	if(secy<=m_SectorMinY) up_empty=true;
+	else {
+		cursec=sec-m_SectorCntX;
+		if(cursec->m_PlanetCnt<0) up_empty=true;
+		else if(cursec->m_PlanetCnt>0 && !IsConnectSector(sec,cursec)) { 
+			if(sec->m_Infl>3 && !cursec->m_InflOwner) {
+				cursec->m_Infl++; if(cursec->m_Infl>5) { cursec->m_PlanetCnt=0; cursec->m_Infl=0; } 
+			}
+			r++; 
+		}
+	}
+
+	if(secy>=m_SectorMinY+m_SectorCntY-1) down_empty=true;
+	else {
+		cursec=sec+m_SectorCntX;
+		if(cursec->m_PlanetCnt<0) down_empty=true;
+		else if(cursec->m_PlanetCnt>0 && !IsConnectSector(sec,cursec)) { 
+			if(sec->m_Infl>3 && !cursec->m_InflOwner) {
+				cursec->m_Infl++; if(cursec->m_Infl>5) { cursec->m_PlanetCnt=0; cursec->m_Infl=0; } 
+			}
+			r++;
+		}
+	}
+
+	if(secx<=m_SectorMinX) left_empty=true;
+	else {
+		cursec=sec-1;
+		if(cursec->m_PlanetCnt<0) left_empty=true;
+		else if(cursec->m_PlanetCnt>0 && !IsConnectSector(sec,cursec)) { 
+			if(sec->m_Infl>3 && !cursec->m_InflOwner) {
+				cursec->m_Infl++; if(cursec->m_Infl>5) { cursec->m_PlanetCnt=0; cursec->m_Infl=0; } 
+			}
+			r++;
+		}
+	}
+
+	if(secx>=m_SectorMinX+m_SectorCntX-1) right_empty=true;
+	else {
+		cursec=sec+1;
+		if(cursec->m_PlanetCnt<0) right_empty=true;
+		else if(cursec->m_PlanetCnt>0 && !IsConnectSector(sec,cursec)) { 
+			if(sec->m_Infl>3 && !cursec->m_InflOwner) {
+				cursec->m_Infl++; if(cursec->m_Infl>5) { cursec->m_PlanetCnt=0; cursec->m_Infl=0; } 
+			}
+			r++;
+		}
+	}
+
+	// up left
+	if(up_empty && left_empty && secy>m_SectorMinY && secx>m_SectorMinX) {
+		cursec=sec-m_SectorCntX-1;
+		if(cursec->m_PlanetCnt>0 && !IsConnectSector(sec,cursec)) { 
+			if(sec->m_Infl>3 && !cursec->m_InflOwner) {
+				cursec->m_Infl++; if(cursec->m_Infl>5) { cursec->m_PlanetCnt=0; cursec->m_Infl=0; } 
+			}
+			r++;
+		}
+	}
+
+	// up right
+	if(up_empty && right_empty && secy>m_SectorMinY && secx<m_SectorMinX+m_SectorCntX-1) {
+		cursec=sec-m_SectorCntX+1;
+		if(cursec->m_PlanetCnt>0 && !IsConnectSector(sec,cursec)) {
+			if(sec->m_Infl>3 && !cursec->m_InflOwner) {
+				cursec->m_Infl++; if(cursec->m_Infl>5) { cursec->m_PlanetCnt=0; cursec->m_Infl=0; }
+			}
+			r++;
+		}
+	}
+
+	// down left
+	if(down_empty && left_empty && secy<m_SectorMinY+m_SectorCntY-1 && secx>m_SectorMinX) {
+		cursec=sec+m_SectorCntX-1;
+		if(cursec->m_PlanetCnt>0 && !IsConnectSector(sec,cursec)) {
+			if(sec->m_Infl>3 && !cursec->m_InflOwner) {
+				cursec->m_Infl++; if(cursec->m_Infl>5) { cursec->m_PlanetCnt=0; cursec->m_Infl=0; }
+			}
+			r++;
+		}
+	}
+
+	// down right
+	if(down_empty && right_empty && secy<m_SectorMinY+m_SectorCntY-1 && secx<m_SectorMinX+m_SectorCntX-1) {
+		cursec=sec+m_SectorCntX+1;
+		if(cursec->m_PlanetCnt>0 && !IsConnectSector(sec,cursec)) {
+			if(sec->m_Infl>3 && !cursec->m_InflOwner) {
+				cursec->m_Infl++; if(cursec->m_Infl>5) { cursec->m_PlanetCnt=0; cursec->m_Infl=0; }
+			}
+			r++;
+		}
+	}
+
+	return r;
+}
+
+/*dword CEmpire::IsConnectAll(int secx,int secy)
+{
+	int fsx=max(m_SectorMinX,secx-1);
+	int fsy=max(m_SectorMinY,secy-1);
+	int esx=min(m_SectorMinX+m_SectorCntX,secx+2);
+	int esy=min(m_SectorMinY+m_SectorCntY,secy+2);
+
+	SSector * sec=m_Sector + ((secx-m_SectorMinX)+(secy-m_SectorMinY)*m_SectorCntX);
+
+	dword r=0;
+
+	SSector * cursec=m_Sector + ((fsx-m_SectorMinX)+(fsy-m_SectorMinY)*m_SectorCntX);
+	for(int sy=fsy;sy<esy;sy++,cursec+=m_SectorCntX-(esx-fsx)) {
+		for(int sx=fsx;sx<esx;sx++,cursec++) {
+			if(sx==secx && sy==secy) continue;
+
+			if(cursec->m_PlanetCnt<=0) continue;
+
+			if(!IsConnectSector(sec,cursec)) {
+				cursec->m_PlanetCnt=0;
+				r++;
+
+//ALogFormat("IsConnectSector false <i>,<i> <i>,<i> <i> <i>",secx,secy,sx,sy,sec->m_PlanetCnt,cursec->m_PlanetCnt);
+//				return false;
+			}
+		}
+	}
+	return r;
+}*/
+
+int CEmpire::AssignOreItemSec(int secx,int secy,int r,int cnt,int itemtype)
+{
+	int i,u,x,y;
+	int sc=0;
+
+	int sx=secx-r; if(sx<m_SectorMinX) sx=m_SectorMinX;
+	int sy=secy-r; if(sy<m_SectorMinY) sy=m_SectorMinY;
+	int ex=secx+r+1; if(ex>m_SectorMinX+m_SectorCntX) ex=m_SectorMinX+m_SectorCntX;
+	int ey=secy+r+1; if(ey>m_SectorMinY+m_SectorCntY) ey=m_SectorMinY+m_SectorCntY;
+
+	while(cnt>0) {
+		cnt--;
+
+		for(i=0;i<100;i++) {
+			x=m_Rnd.Rnd(sx,ex-1);
+			y=m_Rnd.Rnd(sy,ey-1);
+
+			SSector * sec=m_Sector+((x-m_SectorMinX)+(y-m_SectorMinY)*m_SectorCntX);
+			if(sec->m_InflOwner) continue;
+			if(sec->m_PlanetCnt<=0) continue;
+			if(sec->m_PlanetCnt>1) u=m_Rnd.Rnd(0,sec->m_PlanetCnt-1);
+			else u=0;
+			if(u<0 || u>=sec->m_PlanetCnt) ERROR_E;
+			SPlanet * planet=sec->m_Planet+u;
+			if(planet->m_Flag & (PlanetFlagWormhole | PlanetFlagSun | PlanetFlagGigant)) continue;
+			if(planet->m_Flag & PlanetFlagNoCapture) continue;
+			if(planet->m_OreItem) continue;
+
+			planet->m_OreItem=itemtype;
+			sc++;
+		}
+		if(i>=100) break;
+	}
+	return sc;
+}
+
+void CEmpire::AssignOreItem()
+{
+	int i,x,y,u,r,cnt,itemtype;
+    SSector * sec;
+	SPlanet * planet;
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		if(sec->m_InflOwner) continue;
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if(planet->m_Flag & PlanetFlagNoCapture) continue;
+			planet->m_OreItem=0;
+		}
+	}
+
+	int misscnt=0;
+	while(misscnt<100) {
+		x=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+		y=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+
+		r=m_Rnd.Rnd(0,100);
+		if(r<33) itemtype=ItemTypeCrystal;
+		else if(r<66) itemtype=ItemTypeTitan;
+		else itemtype=ItemTypeSilicon;
+
+		if(!AssignOreItemSec(x,y,1,5,itemtype)) {
+			misscnt++;
+		} else {
+			misscnt=0;
+		}
+//ALogFormat("MissCnt=<i>",misscnt);
+	}
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		if(sec->m_InflOwner) continue;
+		sec->m_Ver++;
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if(planet->m_Flag & PlanetFlagNoCapture) continue;
+			if(m_Rnd.Rnd(0,100)<30) planet->m_OreItem=0;
+		}
+	}
+}
+
+void CEmpire::AssignGlobalCotl()
+{
+	int i,u,k,cnt;
+	SSector * sec;
+	SPlanet * planet;
+
+	m_OpsFlag = (m_OpsFlag & ~OpsFlagWinMask) | OpsFlagGlobalCotl;
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if(planet->m_Flag & (PlanetFlagWormhole | PlanetFlagSun | PlanetFlagGigant )) continue;
+
+			m_Calc->PlanetVarPrepare(planet);
+			planet->m_Var->m_Engineer=200;
+			planet->m_Var->m_Machinery=200;
+			for(k=0;k<PlanetItemCnt;k++) {
+				planet->m_Var->m_Item[k].m_Type=0;
+				planet->m_Var->m_Item[k].m_Cnt=0;
+				planet->m_Var->m_Item[k].m_Owner=0;
+				planet->m_Var->m_Item[k].m_Complete=0;
+				planet->m_Var->m_Item[k].m_Broken=0;
+				planet->m_Var->m_Item[k].m_Flag=0;
+			}
+
+			if((planet->m_Flag & (PlanetFlagRich | PlanetFlagLarge))==(PlanetFlagRich | PlanetFlagLarge)) {
+				planet->m_Cell[8]=(BuildingTypeEnergy<<3)|5;
+				planet->m_Cell[9]=(BuildingTypeEnergy<<3)|5;
+				planet->m_Cell[11]=(BuildingTypeEnergy<<3)|5;
+				planet->m_Cell[5]=(BuildingTypeStorage<<3)|5;
+				planet->m_Cell[0]=(BuildingTypeLab<<3)|5;
+				planet->m_Cell[1]=(BuildingTypeLab<<3)|5;
+				planet->m_Cell[2]=(BuildingTypeLab<<3)|5;
+				planet->m_Cell[3]=(BuildingTypeLab<<3)|5;
+				planet->m_Cell[6]=(BuildingTypeLab<<3)|5;
+				planet->m_Cell[10]=(BuildingTypeLab<<3)|5;
+
+				planet->m_Var->m_Item[0].m_Type=ItemTypeModule;
+				planet->m_Var->m_Item[0].m_Flag=PlanetItemFlagBuild|PlanetItemFlagShowCnt;
+
+			} else if(planet->m_Flag & PlanetFlagLarge) {
+				planet->m_Cell[8]=(BuildingTypeEnergy<<3)|5;
+				planet->m_Cell[9]=(BuildingTypeEnergy<<3)|5;
+				planet->m_Cell[11]=(BuildingTypeEnergy<<3)|5;
+				planet->m_Cell[5]=(BuildingTypeStorage<<3)|5;
+				planet->m_Cell[0]=(BuildingTypeCity<<3)|5;
+				planet->m_Cell[1]=(BuildingTypeCity<<3)|5;
+				planet->m_Cell[2]=(BuildingTypeCity<<3)|5;
+				planet->m_Cell[3]=(BuildingTypeCity<<3)|5;
+				planet->m_Cell[6]=(BuildingTypeCity<<3)|5;
+				planet->m_Cell[10]=(BuildingTypeCity<<3)|5;
+
+				planet->m_Var->m_Item[0].m_Type=ItemTypeMoney;
+				planet->m_Var->m_Item[0].m_Flag=PlanetItemFlagBuild|PlanetItemFlagShowCnt;
+
+			} else {
+				planet->m_Cell[4]=(BuildingTypeEnergy<<3)|5;
+				planet->m_Cell[7]=(BuildingTypeEnergy<<3)|5;
+				planet->m_Cell[1]=(BuildingTypeStorage<<3)|5;
+				planet->m_Cell[0]=(BuildingTypeLab<<3)|5;
+				planet->m_Cell[2]=(BuildingTypeLab<<3)|5;
+				planet->m_Cell[5]=(BuildingTypeLab<<3)|5;
+				planet->m_Cell[6]=(BuildingTypeLab<<3)|5;
+
+				planet->m_Var->m_Item[0].m_Type=ItemTypeModule;
+				planet->m_Var->m_Item[0].m_Flag=PlanetItemFlagBuild|PlanetItemFlagShowCnt;
+			}
+			planet->m_CellBuildFlag=0;
+			planet->m_CellBuildEnd=0;
+			planet->m_Sector->m_Ver++;
+			planet->m_Sector->m_VerSlow++;
+		}
+	}
+
+	m_WorldVer++;
+	m_StateVer++;
+}
+
+void CEmpire::CreateWormhole()
+{
+	if(!m_PlanetGrow) ERROR_E;
+	int i,u,t,px,py,cnt;
+    SSector * sec;
+	SPlanet * planet;
+
+//ALogFormat("CreateWormhole Begin");
+
+	int deadspace=50;
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		if(sec->m_PlanetCnt<=0 || sec->m_PlanetCnt>=PlanetOnSectorMaxSys) continue;
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if(planet->m_Flag & PlanetFlagWormhole) break;
+			if((planet->m_Flag & (PlanetFlagSun | PlanetFlagLarge))==(PlanetFlagSun | PlanetFlagLarge)) break;
+		}
+		if(u<sec->m_PlanetCnt) continue;
+
+//ALogFormat("Sector <i>,<i>",sec->m_SectorX,sec->m_SectorY);
+		for(t=0;t<1000;t++) {
+			px=m_Rnd.Rnd(PlanetMinDist/4,SectorSize-PlanetMinDist/4)+int(sec->m_SectorX)*SectorSize;
+			py=m_Rnd.Rnd(PlanetMinDist/4,SectorSize-PlanetMinDist/4)+int(sec->m_SectorY)*SectorSize;
+
+			if(!IsCorrectPlaceForPlanet(px,py,sec->m_SectorX,sec->m_SectorY,deadspace)) continue;
+
+			break;
+		}
+		if(t>=1000) continue;
+
+		planet=sec->m_Planet+sec->m_PlanetCnt;
+		sec->m_PlanetCnt++;
+
+//ALogFormat("CreateWormhole <i>,<i>",sec->m_SectorX,sec->m_SectorY);
+
+		planet->m_PosX=px;
+		planet->m_PosY=py;
+		planet->m_Flag=PlanetFlagWormhole;
+		planet->m_Level=0;
+		planet->m_LevelBuy=0;
+//		planet->m_ConstructionPoint=0;
+		planet->m_ConstructionTime=m_CalcTime;
+		planet->m_CalcBattleTime=m_CalcTime;
+		planet->m_TransportTime=m_CalcTime;
+		planet->m_Race=RaceNone;
+//		planet->m_ConstructionPoint=0;
+		planet->m_OreItem=ItemTypeNone;
+//		planet->m_BuildTime=ct;
+	}
+}
+
+bool CEmpire::TestConvertToSun(SPlanet * planet,int rs)
+{
+	int sx=planet->m_Sector->m_SectorX-rs; if(sx<m_SectorMinX) sx=m_SectorMinX;
+	int sy=planet->m_Sector->m_SectorY-rs; if(sy<m_SectorMinY) sy=m_SectorMinY;
+	int ex=planet->m_Sector->m_SectorX+rs+1; if(ex>m_SectorMinX+m_SectorCntX) ex=m_SectorMinX+m_SectorCntX;
+	int ey=planet->m_Sector->m_SectorY+rs+1; if(ey>m_SectorMinY+m_SectorCntY) ey=m_SectorMinY+m_SectorCntY;
+
+	dword owner=0xffffffff;
+
+	int x,y,fx,fy,i;
+	SSector * sec;
+	SPlanet * planet2, * planet3;
+
+	SPlanet * plist[1024];
+	int pcnt;
+	int psme;
+
+	sec=m_Sector+((sx-m_SectorMinX)+(sy-m_SectorMinY)*m_SectorCntX);
+	for(y=sy;y<ey;y++,sec+=m_SectorCntX-(ex-sx)) {
+		for(x=sx;x<ex;x++,sec++) {
+			planet3=sec->m_Planet;
+			for(i=0;i<sec->m_PlanetCnt;i++,planet3++)  {
+				planet3->m_Island=0;
+				planet3->m_IslandCalc=0;
+			}
+		}
+	}
+
+	plist[0]=planet;
+	pcnt=1;
+	psme=0;
+	planet->m_Island=1;
+
+	while(psme<pcnt) {
+		planet2=plist[psme];
+		psme++;
+
+		int sx2=planet2->m_Sector->m_SectorX-1; if(sx2<m_SectorMinX) sx2=m_SectorMinX;
+		int sy2=planet2->m_Sector->m_SectorY-1; if(sy2<m_SectorMinY) sy2=m_SectorMinY;
+		int ex2=planet2->m_Sector->m_SectorX+2; if(ex2>m_SectorMinX+m_SectorCntX) ex2=m_SectorMinX+m_SectorCntX;
+		int ey2=planet2->m_Sector->m_SectorY+2; if(ey2>m_SectorMinY+m_SectorCntY) ey2=m_SectorMinY+m_SectorCntY;
+
+		sec=m_Sector+((sx2-m_SectorMinX)+(sy2-m_SectorMinY)*m_SectorCntX);
+		for(y=sy2;y<ey2;y++,sec+=m_SectorCntX-(ex2-sx2)) {
+			for(x=sx2;x<ex2;x++,sec++) {
+				planet3=sec->m_Planet;
+				for(i=0;i<sec->m_PlanetCnt;i++,planet3++)  {
+					if(planet3->m_Flag & (PlanetFlagWormhole | PlanetFlagSun | PlanetFlagGigant)) continue;
+
+					if(planet3->m_Island) continue;
+
+					if(planet3->m_Sector->m_SectorX<sx) continue;
+					if(planet3->m_Sector->m_SectorY<sy) continue;
+					if(planet3->m_Sector->m_SectorX>=ex) continue;
+					if(planet3->m_Sector->m_SectorY>=ey) continue;
+
+					int dx=planet3->m_PosX-planet2->m_PosX;
+					int dy=planet3->m_PosY-planet2->m_PosY;
+
+					if((dx*dx+dy*dy)>JumpRadius2) continue;
+
+					if(pcnt>=1024) continue;
+
+					plist[pcnt]=planet3;
+					pcnt++;
+					planet3->m_Island=1;
+				}
+			}
+		}
+	}
+
+	if(pcnt<=2) return false;
+//ALogFormat("pcnt=<i>",pcnt);
+
+	plist[0]=plist[pcnt-1];
+	pcnt=1;
+	psme=0;
+	planet->m_IslandCalc=1;
+
+	while(psme<pcnt) {
+		planet2=plist[psme];
+		psme++;
+
+		int sx2=planet2->m_Sector->m_SectorX-1; if(sx2<m_SectorMinX) sx2=m_SectorMinX;
+		int sy2=planet2->m_Sector->m_SectorY-1; if(sy2<m_SectorMinY) sy2=m_SectorMinY;
+		int ex2=planet2->m_Sector->m_SectorX+2; if(ex2>m_SectorMinX+m_SectorCntX) ex2=m_SectorMinX+m_SectorCntX;
+		int ey2=planet2->m_Sector->m_SectorY+2; if(ey2>m_SectorMinY+m_SectorCntY) ey2=m_SectorMinY+m_SectorCntY;
+
+		sec=m_Sector+((sx2-m_SectorMinX)+(sy2-m_SectorMinY)*m_SectorCntX);
+		for(y=sy2;y<ey2;y++,sec+=m_SectorCntX-(ex2-sx2)) {
+			for(x=sx2;x<ex2;x++,sec++) {
+				planet3=sec->m_Planet;
+				for(i=0;i<sec->m_PlanetCnt;i++,planet3++)  {
+					if(planet3==planet) continue;
+					if(planet3->m_Flag & (PlanetFlagWormhole | PlanetFlagSun | PlanetFlagGigant)) continue;
+
+					if(planet3->m_IslandCalc) continue;
+
+					if(planet3->m_Sector->m_SectorX<sx) continue;
+					if(planet3->m_Sector->m_SectorY<sy) continue;
+					if(planet3->m_Sector->m_SectorX>=ex) continue;
+					if(planet3->m_Sector->m_SectorY>=ey) continue;
+
+					int dx=planet3->m_PosX-planet2->m_PosX;
+					int dy=planet3->m_PosY-planet2->m_PosY;
+
+					if((dx*dx+dy*dy)>JumpRadius2) continue;
+
+					if(pcnt>=1024) continue;
+
+					plist[pcnt]=planet3;
+					pcnt++;
+					planet3->m_IslandCalc=1;
+				}
+			}
+		}
+	}
+
+	bool r=true;
+
+	sec=m_Sector+((sx-m_SectorMinX)+(sy-m_SectorMinY)*m_SectorCntX);
+	for(y=sy;y<ey;y++,sec+=m_SectorCntX-(ex-sx)) {
+		for(x=sx;x<ex;x++,sec++) {
+			planet3=sec->m_Planet;
+			for(i=0;i<sec->m_PlanetCnt;i++,planet3++)  {
+				if(planet3==planet) continue;
+				if(planet3->m_Island!=planet3->m_IslandCalc) { r=false; }
+				planet3->m_Island=0;
+				planet3->m_IslandCalc=0;
+			}
+		}
+	}
+
+//ALogFormat("pcnt2=<i> r=<i>",pcnt,int(r));
+
+	return r;
+}
+
+void CEmpire::AllConvertToSun()
+{
+	int i,u,cnt,ccc;
+	SSector * sec;
+	SPlanet * planet;
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+//		if(sec->m_SectorX<=m_SectorMinX) continue;
+//		if(sec->m_SectorY<=m_SectorMinY) continue;
+//		if(sec->m_SectorY>=m_SectorMinX+m_SectorCntX-1) continue;
+//		if(sec->m_SectorY>=m_SectorMinY+m_SectorCntY-1) continue;
+
+		SPlanet * normalplanet=NULL;
+		SPlanet * sunplanet=NULL;
+
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if(planet->m_Flag & (PlanetFlagSun | PlanetFlagGigant)) { sunplanet=planet; break; }
+			if(planet->m_Flag & (PlanetFlagHomeworld | PlanetFlagCitadel)) { normalplanet=planet; break; }
+			if(planet->m_Flag & (PlanetFlagWormhole | PlanetFlagSun | PlanetFlagGigant)) continue;
+
+			if(!normalplanet) {
+				normalplanet=planet;
+				ccc=1;
+			} else {
+	            ccc++;
+    	        int kv=10000/ccc;
+        	    if(m_Rnd.Rnd(0,10000)<=kv) { normalplanet=planet; }
+			}
+		}
+		if(sunplanet) continue;
+		if(!normalplanet) continue;
+
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if(planet==normalplanet) continue;
+			if(planet->m_Flag & (PlanetFlagWormhole | PlanetFlagSun | PlanetFlagGigant | PlanetFlagRich)) continue;
+			if(planet->m_Flag & (PlanetFlagHomeworld | PlanetFlagCitadel)) continue;
+
+//ALogFormat("!!!TestSun <i>,<i>,<i>",planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,planet->m_PlanetNum);
+			if(!TestConvertToSun(planet,1)) continue;
+			if(!TestConvertToSun(planet,10)) continue;
+//ALogFormat("!!!TestSun OK");
+
+			if(!sunplanet) {
+				sunplanet=planet;
+				ccc=1;
+			} else {
+	            ccc++;
+    	        int kv=10000/ccc;
+        	    if(m_Rnd.Rnd(0,10000)<=kv) { sunplanet=planet; }
+			}
+
+		}
+
+		if(sunplanet) {
+			planet=sunplanet;
+
+			if(FindNearPlanetFlag(planet,SectorSize+(SectorSize>>1),PlanetFlagSun)) {
+				planet->m_Flag|=PlanetFlagGigant;
+			} else {
+				planet->m_Flag|=PlanetFlagSun;
+				planet->m_Flag&=~PlanetFlagLarge;
+			}
+			planet->m_Flag&=~(PlanetFlagGlobalShield|PlanetFlagLocalShield|PlanetFlagBuildSDM);
+
+			while(planet->m_Owner) {
+				SUser * user=UserGet(planet->m_Owner);
+				if(!user) break;
+
+				int v=0;
+				if(planet->m_Level>10) v+=(planet->m_Level+int(planet->m_LevelBuy)-10)*PlanetLevelSDM;
+				v+=int(planet->m_LevelBuy)*PlanetLevelSDM;
+//				v+=planet->m_ConstructionPoint/50;
+				if(v) user->m_SDMChange=VCng(user->m_SDMChange,v);
+				break;
+			}
+			planet->m_Owner=0;
+			planet->m_Race=RaceNone;
+//			planet->m_ConstructionPoint=0;
+			planet->m_OreItem=0;
+			planet->m_Level=0;
+			planet->m_LevelBuy=0;
+			ClearPlanetPath(planet);
+		}
+	}
+}
+
+void CEmpire::AllConvertToRich()
+{
+	int i;
+	int cnt=m_SectorCntX*m_SectorCntY*10;
+//ALogFormat("!!!AllConvertToRich");
+
+	for(i=0;i<cnt;i++) {
+		int x=m_Rnd.Rnd(m_SectorMinX,m_SectorMinX+m_SectorCntX-1);
+		int y=m_Rnd.Rnd(m_SectorMinY,m_SectorMinY+m_SectorCntY-1);
+
+		SSector * sec=GetSector(x,y);
+		if(!sec) continue;
+		if(sec->m_PlanetCnt<=0) continue;
+
+		int planetnum=m_Rnd.Rnd(0,sec->m_PlanetCnt-1);
+		SPlanet * planet=sec->m_Planet+planetnum;
+		if(planet->m_Flag & (PlanetFlagWormhole | PlanetFlagSun | PlanetFlagGigant| PlanetFlagRich)) continue;
+		if(!planet->m_OreItem) continue;
+
+		if(FindNearPlanetFlag(planet,SectorSize*10,PlanetFlagRich)) continue;
+
+		planet->m_Flag|=PlanetFlagRich|PlanetFlagLarge;
+//ALogFormat("!!!RichFind");
+	}
+}
+
+#define ATT(atm,tmp,tect,l1,l2,l3) (atm)|((tmp)<<3)|((tect)<<5)|((l1)<<7)|((l2)<<10)|((l3)<<13)
+
+void CEmpire::ATTRnd()
+{
+	int cnt,i,u;
+	SSector * sec;
+	SPlanet * planet;
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if(planet->m_Flag & (PlanetFlagWormhole|PlanetFlagSun)) planet->m_ATT=0;
+			else if((planet->m_Flag & (PlanetFlagGigant|PlanetFlagLarge))==(PlanetFlagGigant|PlanetFlagLarge)) planet->m_ATT=ATT(PlanetAtmHydrogen,0,0,0,0,0);
+			else if(planet->m_Flag & PlanetFlagGigant) planet->m_ATT=0;
+			else {
+				int atm=m_Rnd.Rnd(0,100);
+				if(atm<25) atm=PlanetAtmNone;
+				else if(atm<50) atm=PlanetAtmAcid;
+				else if(atm<75) atm=PlanetAtmOxigen;
+				else atm=PlanetAtmNitric;
+
+				planet->m_ATT=ATT(
+					atm,
+					m_Rnd.Rnd(PlanetTmpCold,PlanetTmpHot),
+					m_Rnd.Rnd(PlanetTecPassive,PlanetTecSeismic),
+					m_Rnd.Rnd(0,1),
+					m_Rnd.Rnd(0,1),
+					m_Rnd.Rnd(0,1)
+					);
+			}
+		}
+	}
+}
+
+CEmpire::SPlanet * CEmpire::FindNearPlanetFlag(SPlanet * planet,int maxd,dword flag)
+{
+	int i,x,y;
+	SSector * sec;
+	SPlanet * planet3;
+
+	int cs=2+maxd/SectorSize;
+	maxd*=maxd;
+
+	int sx2=planet->m_Sector->m_SectorX-cs; if(sx2<m_SectorMinX) sx2=m_SectorMinX;
+	int sy2=planet->m_Sector->m_SectorY-cs; if(sy2<m_SectorMinY) sy2=m_SectorMinY;
+	int ex2=planet->m_Sector->m_SectorX+cs+1; if(ex2>m_SectorMinX+m_SectorCntX) ex2=m_SectorMinX+m_SectorCntX;
+	int ey2=planet->m_Sector->m_SectorY+cs+1; if(ey2>m_SectorMinY+m_SectorCntY) ey2=m_SectorMinY+m_SectorCntY;
+
+	SPlanet * planetnear=NULL;
+	int md;
+
+	sec=m_Sector+((sx2-m_SectorMinX)+(sy2-m_SectorMinY)*m_SectorCntX);
+	for(y=sy2;y<ey2;y++,sec+=m_SectorCntX-(ex2-sx2)) {
+		for(x=sx2;x<ex2;x++,sec++) {
+			planet3=sec->m_Planet;
+			for(i=0;i<sec->m_PlanetCnt;i++,planet3++)  {
+				if(!(planet3->m_Flag & flag)) continue;
+
+				int dx=planet3->m_PosX-planet->m_PosX;
+				int dy=planet3->m_PosY-planet->m_PosY;
+
+				int rr=dx*dx+dy+dy;
+				if(rr>maxd) continue;
+
+				if(!planetnear || rr<md) {
+					planetnear=planet3;
+					md=rr;
+				}
+			}
+		}
+	}
+	return planetnear;
+}
+
+bool CEmpire::TestConnectAllPlanet(bool skip_sun_gigant)
+{
+	int i,u,cnt,ccc,x,y;
+	SSector * sec;
+	SPlanet * planet, * planet2, * planet3;
+
+	SPlanet * plfirst=NULL;
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			planet->m_Island=0;
+
+			if(!plfirst) {
+				if(planet->m_Flag & (PlanetFlagWormhole | PlanetFlagSun | PlanetFlagGigant));
+				else plfirst=planet;
+			}
+		}
+	}
+
+	SPlanet * * plist=(SPlanet **)HAlloc(cnt*4*sizeof(SPlanet *),NULL);
+
+	plist[0]=plfirst;
+	int pcnt=1;
+	int psme=0;
+	plfirst->m_Island=0;
+
+	while(psme<pcnt) {
+		planet2=plist[psme];
+		psme++;
+
+		int sx2=planet2->m_Sector->m_SectorX-1; if(sx2<m_SectorMinX) sx2=m_SectorMinX;
+		int sy2=planet2->m_Sector->m_SectorY-1; if(sy2<m_SectorMinY) sy2=m_SectorMinY;
+		int ex2=planet2->m_Sector->m_SectorX+2; if(ex2>m_SectorMinX+m_SectorCntX) ex2=m_SectorMinX+m_SectorCntX;
+		int ey2=planet2->m_Sector->m_SectorY+2; if(ey2>m_SectorMinY+m_SectorCntY) ey2=m_SectorMinY+m_SectorCntY;
+
+		sec=m_Sector+((sx2-m_SectorMinX)+(sy2-m_SectorMinY)*m_SectorCntX);
+		for(y=sy2;y<ey2;y++,sec+=m_SectorCntX-(ex2-sx2)) {
+			for(x=sx2;x<ex2;x++,sec++) {
+				planet3=sec->m_Planet;
+				for(i=0;i<sec->m_PlanetCnt;i++,planet3++)  {
+					if(planet3->m_Flag & (PlanetFlagWormhole)) continue;
+					if(skip_sun_gigant && (planet3->m_Flag & (PlanetFlagSun | PlanetFlagGigant))) continue;
+
+					if(planet3->m_Island) continue;
+
+					int dx=planet3->m_PosX-planet2->m_PosX;
+					int dy=planet3->m_PosY-planet2->m_PosY;
+
+					if((dx*dx+dy*dy)>JumpRadius2) continue;
+
+					if(pcnt>=(cnt<<2)) ERROR_E;
+
+					plist[pcnt]=planet3;
+					pcnt++;
+					planet3->m_Island=1;
+				}
+			}
+		}
+	}
+
+	HFree(plist,NULL);
+
+	bool r=true;
+
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if(planet->m_Flag & (PlanetFlagWormhole)) continue;
+			if(skip_sun_gigant && (planet->m_Flag & (PlanetFlagSun | PlanetFlagGigant))) continue;
+			if(!planet->m_Island) {
+				ALogFormat("PlanetConnectError <i> <i> <i>",planet->m_Sector->m_SectorX,planet->m_Sector->m_SectorY,planet->m_PlanetNum);
+				r=false;
+			}
+			planet->m_Island=0;
+		}
+	}
+
+	return r;
+}
+
+bool CEmpire::PulsarClearNear()
+{
+	int i,u,cnt,x,y;
+	SSector * sec,* sec2;
+	SPlanet * planet;
+
+//	dword at=my_time_nq();
+//	dword ct=my_time();
+
+	cnt=m_SectorCntX*m_SectorCntY;
+	sec=m_Sector;
+	for(i=0;i<cnt;i++,sec++) {
+		planet=sec->m_Planet;
+		for(u=0;u<sec->m_PlanetCnt;u++,planet++) {
+			if((planet->m_Flag & (PlanetFlagSun | PlanetFlagLarge))!=(PlanetFlagSun | PlanetFlagLarge)) continue;
+			break;
+		}
+		if(u>=sec->m_PlanetCnt) continue;
+
+		if(sec->m_PlanetCnt!=1) return false;
+
+		int sx2=sec->m_SectorX-1; if(sx2<m_SectorMinX) sx2=m_SectorMinX;
+		int sy2=sec->m_SectorY-1; if(sy2<m_SectorMinY) sy2=m_SectorMinY;
+		int ex2=sec->m_SectorX+2; if(ex2>m_SectorMinX+m_SectorCntX) ex2=m_SectorMinX+m_SectorCntX;
+		int ey2=sec->m_SectorY+2; if(ey2>m_SectorMinY+m_SectorCntY) ey2=m_SectorMinY+m_SectorCntY;
+
+		sec2=m_Sector+((sx2-m_SectorMinX)+(sy2-m_SectorMinY)*m_SectorCntX);
+		for(y=sy2;y<ey2;y++,sec2+=m_SectorCntX-(ex2-sx2)) {
+			for(x=sx2;x<ex2;x++,sec2++) {
+				planet=sec2->m_Planet;
+				for(u=0;u<sec2->m_PlanetCnt;u++,planet++)  {
+					if((planet->m_Flag & (PlanetFlagSun | PlanetFlagLarge))==(PlanetFlagSun | PlanetFlagLarge)) continue;
+					if(planet->m_Flag & (PlanetFlagSun | PlanetFlagGigant | PlanetFlagWormhole)) continue;
+
+//ALogFormat("!!!PulsarClearNear");
+					planet->m_Flag|=PlanetFlagGigant;
+					planet->m_Level=0;
+					planet->m_Race=0;
+					planet->m_LevelBuy=0;
+//					planet->m_ConstructionPoint=0;
+					planet->m_ConstructionTime=m_CalcTime;
+					planet->m_CalcBattleTime=m_CalcTime;
+					planet->m_TransportTime=m_CalcTime;
+					planet->m_Race=RaceNone;
+					planet->m_OreItem=ItemTypeNone;
+//					planet->m_ConstructionPoint=0;
+				}
+			}
+		}
+	}
+
+	return true;
+}
+

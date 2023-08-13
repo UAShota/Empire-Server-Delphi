@@ -1,0 +1,102 @@
+    // Загрузка транспорта
+    procedure DoLoadTransport();
+    // Загрузка строений
+    procedure DoLoadBuildings();
+    // Загрузка хранилищ
+    procedure DoLoadStorages();
+
+
+(*procedure TPlanetarThread.DoLoadTransport();
+var
+  TmpGroup: TPlTransferPath;
+  TmpPlanet: TPlPlanet;
+  TmpPlanetLink: TPlPlanet;
+begin
+  FillChar(TmpGroup, SizeOf(TmpGroup), 0);
+
+  with TDataAccess.Call('1LoadTransport', [Player.UID]) do
+  try
+    while ReadRow() do
+    begin
+      if (ReadInteger('ID_GROUP') <> TmpGroup.Group) then
+      begin
+        if Assigned(TmpGroup.Planets)
+          and (TmpGroup.Planets.Count > 0)
+        then
+          FListTransportPaths.Add(TmpGroup);
+        TmpGroup.Group := ReadInteger('ID_GROUP');
+        TmpGroup.Planets := TPlPlanetList.Create();
+      end;
+
+      TmpPlanet := FControlPlanets.PlanetByRaw(ReadInteger('ID_SOURCE'));
+      TmpPlanetLink := FControlPlanets.PlanetByRaw(ReadInteger('ID_DESTINATION'));
+
+      if (not ReadInteger('LEADER')>0) then
+        TmpGroup.Leader := TmpPlanet;
+
+      TmpPlanetLink.ResPathIn.Add(TmpPlanet);
+      TmpPlanet.ResPathOut := TmpPlanetLink;
+
+      TmpGroup.Planets.Add(TmpPlanetLink);
+    end;
+    if (Assigned(TmpGroup) and Assigned(TmpGroup.Planets) and (TmpGroup.Planets.Count > 0)) then
+      FListTransportPaths.Add(TmpGroup);
+  finally
+    Free();
+  end;
+end;   *)
+
+
+
+(*procedure TPlanetarThread.DoLoadBuildings();
+var
+  TmpBuilding: TPlBuilding;
+  TmpPlanet: TPlPlanet;
+begin
+  with TDataAccess.Call('PLLoadDataBuilding', [Player.UID]) do
+  try
+    while ReadRow() do
+    begin
+      TmpBuilding := TPlBuilding.Create();
+
+      TmpPlanet := FControlPlanets.PlanetByRaw(ReadInteger('ID_PLANET'));
+
+      TmpBuilding.Level := ReadInteger('LEVEL');
+      TmpBuilding.BuildingType := TPlBuildingType(ReadInteger('ID_TYPE') - 1);
+      TmpBuilding.Position := ReadInteger('POSITION');
+      TmpBuilding.HP := ReadInteger('HP');
+      TmpBuilding.Planet := TmpPlanet;
+
+      if (TmpBuilding.HP = 0) then
+        ControlBuildings.ConstructDone(TmpBuilding, False, True)
+      else
+        ControlBuildings.Construct(TmpBuilding);
+
+      TmpPlanet.Buildings.Add(TmpBuilding.Position, TmpBuilding);
+    end;
+  finally
+    Free();
+  end;
+end;
+
+procedure TPlanetarThread.DoLoadStorages();
+var
+  TmpPosition: Integer;
+  TmpPlanet: TPlPlanet;
+begin
+  with TDataAccess.Call('PLLoadDataStorage', [Player.UID]) do
+  try
+    while ReadRow() do
+    begin
+      TmpPlanet := FControlPlanets.PlanetByRaw(ReadInteger('ID_PLANET'));
+      TmpPosition := ReadInteger('POSITION');
+      // Создадим хранилище
+      ControlStorages.IncrementResource(TGlResourceType(ReadInteger('ID_RESOURCE')), TmpPlanet,
+        ReadInteger('COUNT'), False, TmpPosition, True);
+      // Установим свойство слоту
+      ControlStorages.SetFlag(TmpPlanet, TmpPosition, ReadInteger('FLAGS'));
+    end;
+  finally
+    Free();
+  end;
+end;   *)

@@ -1,0 +1,2 @@
+﻿UPDATE pl_dict_tech_data aa SET aa.name=(SELECT NAME FROM pl_dict_buildings bb WHERE aa.id_object = bb.uid) where aa.ID_TYPE=2;
+UPDATE pl_dict_tech_data aa SET aa.description=(SELECT name FROM pl_dict_tech_buildings bb WHERE aa.id_tech = bb.uid) where aa.ID_TYPE=2;
